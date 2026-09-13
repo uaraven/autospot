@@ -1,0 +1,56 @@
+# Autospot configuration.
+#
+# This file is read once at startup. Restart the app (or the scheduled task) after
+# editing it. Run `autospot.exe status` to see the Wi-Fi interfaces, adapter names and
+# hotspot state that this config resolves to.
+
+[monitor]
+# How often to check Wi-Fi state, in seconds.
+poll_interval_secs = 5
+
+# How long Wi-Fi must be continuously down before the hotspot is switched on.
+disconnect_threshold_secs = 120
+
+# Switch the hotspot back off when Wi-Fi returns. Only hotspots that Autospot started
+# itself are switched off; one you turned on by hand is left alone.
+auto_disable_on_reconnect = true
+
+[hotspot]
+# Network name broadcast by the hotspot. Max 32 bytes.
+ssid = "MyFallbackHotspot"
+
+# WPA2 passphrase. Must be 8-63 characters.
+passphrase = "changeme123"
+
+# Auto | TwoPointFourGigahertz | FiveGigahertz | SixGigahertz
+# Aliases "2.4GHz", "5GHz" and "6GHz" also work. Not every Wi-Fi driver supports
+# setting a band; when it does not, Autospot logs a warning and uses the driver default.
+band = "Auto"
+
+# The adapter whose internet connection is shared, as named in Windows
+# ("Ethernet", "Wi-Fi", ...). The hardware description works too. The adapter must be
+# plugged in and up for the hotspot to have anything to share.
+# `autospot.exe status` lists the exact names available on this machine.
+# Use "auto" instead of a name to let Autospot pick whichever connected network currently
+# has the best connectivity (it re-checks every time, and never picks the hotspot's own
+# virtual adapter).
+uplink_adapter = "auto"
+
+[status-dump]
+# Enables status dump for microcontroller monitor
+enabled = true
+# Find the disk with the label and write status to the file.
+disk_label = "CIRCUITPY"
+# Alternatively, you can specify a path to a directory on any disk. The file is
+# disk_path = "E:\\"
+# File name to write the status JSON to. File is always written to the root of the disk.
+file_name = "status.json"
+
+
+[logging]
+# error | warn | info | debug | trace
+level = "info"
+
+# Relative paths are resolved against the directory holding autospot.exe. The file is
+# rotated daily, producing autospot.log.YYYY-MM-DD.
+path = "autospot.log"
