@@ -49,6 +49,9 @@ The code runs only once when the controller starts. Every time the status is upd
 
 When implementing the `show_info` function, keep in mind the use case - indicating network status of the NINA computer to astrophotographers. Display information in the simplest and most readable format, and use red colour to preserve the user's night vision. Avoid bright lights (i.e. don't use bright LEDs even if the board has the best LEDs in the world).
 
+### License
+
+If you want the code for your board to be included in the Autospot GitHub repo, your contribution must be licensed under the terms of GPL-3 license. 
 
 ## Example
 
