@@ -1,24 +1,24 @@
 # Adding support for a new board
 
 To add support for a new board, one should implement a HAL (hardware abstraction layer) for this board.
-Behind this name hides a simple python module with two functions:
+Behind this fancy name is a simple Python module with two functions:
 
  - initialize_display()
  - show_info(items: dict)
 
-## initialize_diplay
+## initialize_display
 
-Autospot companion uses Adafriut's [displayio](https://docs.circuitpython.org/en/latest/shared-bindings/displayio/) library for the display output.
+Autospot companion uses Adafruit's [displayio](https://docs.circuitpython.org/en/latest/shared-bindings/displayio/) library for the display output.
 
 For more information on `displayio` and how to use it refer to this [tutorial](https://learn.adafruit.com/circuitpython-display-support-using-displayio/introduction).
 
-`initialze_display()` function should perform all the necessary setup to configure the display: setup pins, configure corresponding bus (SPI, I2C, etc).
+The `initialize_display()` function should perform all the necessary setup to configure the display: setup pins, configure the corresponding bus (SPI, I2C, etc).
 
 ## show_info
 
-`show_info(info: dict)` function is the workhorse of the autospot companion. It takes a dictionary of the current autospot state and converts it into the image on the display. It can use whatever necessary to display the information - it must adapt the information to display size, colour and drawing capabilities.
+The `show_info(info: dict)` function is the workhorse of the autospot companion. It takes a dictionary of the current autospot state and converts it into an image on the display. It can use whatever is necessary to display the information - it must adapt the information to the display's size, colour and drawing capabilities.
 
-The input `info` dictionary will have at least one element: `status`.  `info['status']` is a string and can have one of the following values:
+The input `info` dictionary will have at least one element: `status`. `info['status']` is a string and can have one of the following values:
  - "connected" - the main computer is connected to a network
  - "hotspot" - the main computer is in hotspot mode
  - "disconnected" - the main computer is not connected to any network, but the hotspot is not yet active
@@ -45,13 +45,11 @@ No other keys are available.
 
 ## Implementation notes
 
-The code runs only once when the controller starts. Every time the status is updated, controller is reset and the main code in `code.py` runs again calling each of the HAL's function once.
+The code runs only once when the controller starts. Every time the status is updated, the controller is reset and the main code in `code.py` runs again, calling each of the HAL's functions once.
 
-When implementing the `show_info` functon, keep in mind the use case - indicating network status of the NINA computer to the astrophotographers. Display information in a most simple and readable format, used red colour to preserve user's night vision. Avoid bright lights (i.e. don't use bright LEDs even if the board has the best LEDs in the world).
+When implementing the `show_info` function, keep in mind the use case - indicating network status of the NINA computer to astrophotographers. Display information in the simplest and most readable format, and use red colour to preserve the user's night vision. Avoid bright lights (i.e. don't use bright LEDs even if the board has the best LEDs in the world).
 
 
 ## Example
 
 For the example, please refer to [LilyGo T-Display RP2040 HAL implementation](LilyGo%20T-Display%20RP2040/hal.py)
-
-

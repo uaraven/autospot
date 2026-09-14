@@ -10,7 +10,7 @@ This repository contains the source code for the Autospot companion. This code r
 
 ## Requirements
 
-A microcontroller that is compatible with CircuitPython 10, has a display, and presents itself as a USB mass-storage device. Examples include Lilygo T-Display RP2040, LilyGo T-Dongle S3, etc.
+A microcontroller that is compatible with CircuitPython 10, has a display, and presents itself as a USB mass-storage device. Examples include LilyGo T-Display RP2040, LilyGo T-Dongle S3, etc.
 
 ### Why USB mass-storage?
 
@@ -37,16 +37,16 @@ When the companion starts, it looks for the status.json file on its storage. If 
 
 |          Board          | CircuitPython download                                   | Notes                                        |
 | :---------------------: | :------------------------------------------------------- | :------------------------------------------- |
-| LILYGO T-Display RP2040 | https://circuitpython.org/board/lilygo_t_display_rp2040/ | It looks like Lilygo discontinued this board |
+| LilyGo T-Display RP2040 | https://circuitpython.org/board/lilygo_t_display_rp2040/ | It looks like LilyGo discontinued this board |
 
 
 ## Contributing
 
 If you want to add support for a new microcontroller board follow these steps:
  - create a directory for your board in `hal` folder
- - create `lib` folder and copy any Circuitpyhon libraries that are needed by the board there
- - create `hal.py` file and implement following functions:
-   - initialize_display() - to initialize display 
+ - create `lib` folder and copy any CircuitPython libraries that are needed by the board there
+ - create `hal.py` file and implement the following functions:
+   - initialize_display() - to initialize the display
    - show_info(items: dict) - to display the information
  - create pull request
 
