@@ -18,12 +18,14 @@ The companion code is as simple as it gets - it reads the file from the storage 
 
 CircuitPython automatically presents the microcontroller's flash memory as a USB drive for the _compatible_ devices. Usually, "compatible" means a device that can manage USB connection on its own. A lot of popular ESP-based microcontrollers are not supported, as they require a separate chip for USB connection.
 
-I recommend RP2040-based devices, they are cheap, support USB and are compatible with CircuitPython. One can get a Lilygo T-Display RP2040 for $20 with enclosure and that's all you need.
-ESP32-S3 (but not C-series) based devices should also work.
+See [below](#supported-boards) for the list of tested boards.
 
 ## Installation
 
-Install [CircuitPython](https://circuitpython.org/downloads) version 10 onto your microcontroller and then copy `code.py` file and `lib` folder to the CIRCUITPY drive.
+Install [CircuitPython](https://circuitpython.org/downloads) version 10 onto your microcontroller and then copy `code.py` and `boot.py` files to the CIRCUITPY drive.
+In the `hal` directory select the folder corresponding to your microcontroller and copy `hal.py` file and `lib` folder to the CIRCUITPY drive as well.
+**Note**: All the files must be copied to the root of the CIRCUITPY drive. After copying, unmount the disk, disconnect it and then reconnect it back again.
+You should now see AUTOSPOT disk drive.
 
 Run autospot - the status of the connection should be displayed on the controller's display. If you change the drive label from CIRCUITPY to something else, don't forget to edit the autospot.toml file and update the label name.
 
@@ -31,8 +33,26 @@ Run autospot - the status of the connection should be displayed on the controlle
 
 When the companion starts, it looks for the status.json file on its storage. If the file is present, it will display the status stored in this file. If the autospot program is not running on the connected computer, the companion will display a stale value left over from previous runs - the storage is read-only for the microcontroller, so it cannot change it.
 
+## Supported boards
+
+|          Board          | CircuitPython download                                   | Notes                                        |
+| :---------------------: | :------------------------------------------------------- | :------------------------------------------- |
+| LILYGO T-Display RP2040 | https://circuitpython.org/board/lilygo_t_display_rp2040/ | It looks like Lilygo discontinued this board |
+
+
+## Contributing
+
+If you want to add support for a new microcontroller board follow these steps:
+ - create a directory for your board in `hal` folder
+ - create `lib` folder and copy any Circuitpyhon libraries that are needed by the board there
+ - create `hal.py` file and implement following functions:
+   - initialize_display() - to initialize display 
+   - show_info(items: dict) - to display the information
+ - create pull request
+
+See [this file](hal/readme.md) for more details on HAL implementation.
+
 ## License
 
 This companion is licensed under the GNU General Public License v3.0 (GPLv3) -- see
-[LICENSE](LICENSE). 
-
+[LICENSE](LICENSE).

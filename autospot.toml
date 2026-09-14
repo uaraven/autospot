@@ -40,7 +40,7 @@ uplink_adapter = "auto"
 # Enables status dump for microcontroller monitor
 enabled = true
 # Find the disk with the label and write status to the file.
-disk_label = "CIRCUITPY"
+disk_label = "AUTOSPOT"
 # Alternatively, you can specify a path to a directory on any disk. The file is
 # disk_path = "E:\\"
 # File name to write the status JSON to. File is always written to the root of the disk.
