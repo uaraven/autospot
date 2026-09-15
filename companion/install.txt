@@ -1,0 +1,15 @@
+Autospot Companion Installation
+
+Install CircuitPython(https://circuitpython.org/downloads) version 10 onto your microcontroller. Follow instructions on circuitpython page for your board to complete installation/
+
+Connect the board to the computer - the CIRCUITPY disk drive should appear in the explorer.
+
+Copy code.py and boot.py files to the root of CIRCUITPY drive.
+
+In the hal directory find the folder corresponding to your board model and copy hal.py file and lib folder to the CIRCUITPY drive as well.
+
+After copying, unmount the disk, disconnect it and then reconnect it back again.
+
+The CIRCUITPY drive should disappear and you should now see AUTOSPOT disk drive in Explorer.
+
+Run autospot - the status of the connection should be displayed on the controller's display.

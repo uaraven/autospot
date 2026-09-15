@@ -1,5 +1,6 @@
 # Builds autospot in release mode and packs the exe + config into a zip
-# under dist/, named after the version in Cargo.toml.
+# under dist/, named after the version in Cargo.toml. Also packs the companion
+# microcontroller code into a separate companion-v{version}.zip.
 
 $ErrorActionPreference = "Stop"
 
@@ -32,3 +33,22 @@ if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path $exePath, $tomlPath -DestinationPath $zipPath
 
 Write-Host "Created $zipPath"
+
+$companionDir = "$root\companion"
+$companionPaths = @(
+    "$companionDir\boot.py",
+    "$companionDir\code.py",
+    "$companionDir\LICENSE",
+    "$companionDir\install.txt",
+    "$companionDir\hal"
+)
+foreach ($path in $companionPaths) {
+    if (-not (Test-Path $path)) { throw "Missing $path" }
+}
+
+$companionZipPath = "$distDir\companion-v$version.zip"
+if (Test-Path $companionZipPath) { Remove-Item $companionZipPath -Force }
+
+Compress-Archive -Path $companionPaths -DestinationPath $companionZipPath
+
+Write-Host "Created $companionZipPath"

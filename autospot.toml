@@ -6,7 +6,7 @@
 
 [monitor]
 # How often to check Wi-Fi state, in seconds.
-poll_interval_secs = 5
+poll_interval_secs = 15
 
 # How long Wi-Fi must be continuously down before the hotspot is switched on.
 disconnect_threshold_secs = 120
@@ -36,8 +36,8 @@ band = "Auto"
 # virtual adapter).
 uplink_adapter = "auto"
 
-[status-dump]
-# Enables status dump for microcontroller monitor
+[companion]
+# Enables integration with  companion microcontroller monitor
 enabled = true
 # Find the disk with the label and write status to the file.
 disk_label = "AUTOSPOT"
@@ -49,7 +49,12 @@ file_name = "status.json"
 
 [logging]
 # error | warn | info | debug | trace
-level = "info"
+# Level for the rotated log file. Defaults to "error" to keep routine status lines out
+# of the file; the console (below) is where they're meant to be read live.
+file_level = "error"
+
+# Level for the console.
+stdout_level = "info"
 
 # Relative paths are resolved against the directory holding autospot.exe. The file is
 # rotated daily, producing autospot.log.YYYY-MM-DD.

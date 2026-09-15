@@ -45,6 +45,27 @@ impl Adapter {
     }
 }
 
+/// IP address of the adapter with the given hardware description, if it has one.
+///
+/// `wlanapi`'s interface description and IP Helper's adapter description are both the
+/// driver's own text, so they match directly without needing to cross-reference GUIDs.
+pub fn ipv4_of<'a>(adapters: &'a [Adapter], description: &str) -> Option<&'a str> {
+    adapters
+        .iter()
+        .find(|a| a.description.eq_ignore_ascii_case(description))
+        .and_then(|a| a.ipv4.first())
+        .map(String::as_str)
+}
+
+/// IP address of whichever adapter sits on the Mobile Hotspot's own ICS subnet.
+pub fn hotspot_ip(adapters: &[Adapter]) -> Option<&str> {
+    adapters
+        .iter()
+        .flat_map(|a| a.ipv4.iter())
+        .find(|ip| ip.starts_with(HOTSPOT_SUBNET_PREFIX))
+        .map(String::as_str)
+}
+
 /// Enumerate every network adapter on the machine.
 pub fn list() -> Result<Vec<Adapter>> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
@@ -181,18 +202,18 @@ fn parse_guid(text: &str) -> Option<GUID> {
 mod tests {
     use super::*;
 
-    fn adapter(friendly: &str, description: &str) -> Adapter {
+    fn adapter(friendly: &str, description: &str, ipv4: &[&str]) -> Adapter {
         Adapter {
             guid: GUID::zeroed(),
             friendly_name: friendly.into(),
             description: description.into(),
-            ipv4: Vec::new(),
+            ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     #[test]
     fn matches_the_friendly_name_case_insensitively() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller");
+        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
         assert!(a.matches("Ethernet"));
         assert!(a.matches("ethernet"));
         assert!(a.matches("  Ethernet  "));
@@ -200,20 +221,24 @@ mod tests {
 
     #[test]
     fn matches_the_hardware_description_too() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller");
+        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
         assert!(a.matches("Realtek PCIe GbE Family Controller"));
     }
 
     #[test]
     fn does_not_match_a_different_adapter() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller");
+        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
         assert!(!a.matches("Wi-Fi"));
         assert!(!a.matches("Ether"));
     }
 
     #[test]
     fn recognises_the_hotspot_virtual_adapter_by_its_ics_subnet() {
-        let mut a = adapter("Local Area Connection* 2", "Microsoft Wi-Fi Direct Virtual Adapter");
+        let mut a = adapter(
+            "Local Area Connection* 2",
+            "Microsoft Wi-Fi Direct Virtual Adapter",
+            &[],
+        );
         assert!(!a.is_hotspot_virtual_adapter());
         a.ipv4.push("192.168.137.1".to_string());
         assert!(a.is_hotspot_virtual_adapter());
@@ -221,9 +246,37 @@ mod tests {
 
     #[test]
     fn does_not_mistake_a_normal_adapter_for_the_hotspot_one() {
-        let mut a = adapter("Wi-Fi", "Intel(R) Wireless-AC 7260");
+        let mut a = adapter("Wi-Fi", "Intel(R) Wireless-AC 7260", &[]);
         a.ipv4.push("192.168.10.218".to_string());
         assert!(!a.is_hotspot_virtual_adapter());
+    }
+
+    #[test]
+    fn ipv4_of_matches_by_hardware_description_case_insensitively() {
+        let adapters = [adapter("Ethernet", "Realtek PCIe GbE", &["10.0.0.5"])];
+        assert_eq!(ipv4_of(&adapters, "realtek pcie gbe"), Some("10.0.0.5"));
+        assert_eq!(ipv4_of(&adapters, "nope"), None);
+    }
+
+    #[test]
+    fn ipv4_of_is_none_when_the_adapter_has_no_address() {
+        let adapters = [adapter("Ethernet", "Realtek PCIe GbE", &[])];
+        assert_eq!(ipv4_of(&adapters, "Realtek PCIe GbE"), None);
+    }
+
+    #[test]
+    fn hotspot_ip_finds_the_ics_subnet_address() {
+        let adapters = [
+            adapter("Wi-Fi", "desc1", &["192.168.10.218"]),
+            adapter("Local Area Connection* 2", "desc2", &["192.168.137.1"]),
+        ];
+        assert_eq!(hotspot_ip(&adapters), Some("192.168.137.1"));
+    }
+
+    #[test]
+    fn hotspot_ip_is_none_without_a_matching_subnet() {
+        let adapters = [adapter("Wi-Fi", "desc1", &["192.168.10.218"])];
+        assert_eq!(hotspot_ip(&adapters), None);
     }
 
     #[test]
