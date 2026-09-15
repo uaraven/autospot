@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 /// Name of the config file looked up next to the executable when no path is given.
@@ -17,8 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub monitor: MonitorConfig,
     pub hotspot: HotspotConfig,
-    #[serde(default, rename = "status-dump")]
-    pub status_dump: StatusDumpConfig,
+    #[serde(default)]
+    pub companion: CompanionConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
 }
@@ -67,7 +67,7 @@ impl HotspotConfig {
 /// polling from an attached drive being the motivating case.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct StatusDumpConfig {
+pub struct CompanionConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Volume label of the disk to write to, e.g. "CIRCUITPY". Resolved fresh (by
@@ -82,17 +82,17 @@ pub struct StatusDumpConfig {
     pub disk_path: Option<String>,
     /// File name written at the root of the resolved disk. Must be a plain file name,
     /// not a path.
-    #[serde(default = "default_status_dump_file_name")]
+    #[serde(default = "default_companion_status_file_name")]
     pub file_name: String,
 }
 
-impl Default for StatusDumpConfig {
+impl Default for CompanionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             disk_label: None,
             disk_path: None,
-            file_name: default_status_dump_file_name(),
+            file_name: default_companion_status_file_name(),
         }
     }
 }
@@ -100,8 +100,14 @@ impl Default for StatusDumpConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
+    /// Level for the rotated log file. Defaults to `error` so routine status lines
+    /// don't pile up on disk -- the console is the primary place output is read.
+    #[serde(default = "default_file_log_level")]
+    pub file_level: String,
+    /// Level for the console. Defaults to `info` so the status line is visible while
+    /// the app runs in the foreground.
+    #[serde(default = "default_stdout_log_level")]
+    pub stdout_level: String,
     /// Log file path. A relative path is resolved against the executable's directory
     /// so the task scheduler's working directory does not matter.
     #[serde(default = "default_log_path")]
@@ -130,13 +136,16 @@ fn default_disconnect_threshold_secs() -> u64 {
 fn default_true() -> bool {
     true
 }
-fn default_log_level() -> String {
+fn default_file_log_level() -> String {
+    "error".to_string()
+}
+fn default_stdout_log_level() -> String {
     "info".to_string()
 }
 fn default_log_path() -> PathBuf {
     PathBuf::from("autospot.log")
 }
-fn default_status_dump_file_name() -> String {
+fn default_companion_status_file_name() -> String {
     "status.json".to_string()
 }
 
@@ -153,7 +162,8 @@ impl Default for MonitorConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: default_log_level(),
+            file_level: default_file_log_level(),
+            stdout_level: default_stdout_log_level(),
             path: default_log_path(),
         }
     }
@@ -202,16 +212,22 @@ impl Config {
             bail!("hotspot.uplink_adapter must not be empty");
         }
 
-        if parse_level(&self.logging.level).is_none() {
+        if parse_level(&self.logging.file_level).is_none() {
             bail!(
-                "logging.level must be one of error|warn|info|debug|trace, got '{}'",
-                self.logging.level
+                "logging.file_level must be one of error|warn|info|debug|trace, got '{}'",
+                self.logging.file_level
+            );
+        }
+        if parse_level(&self.logging.stdout_level).is_none() {
+            bail!(
+                "logging.stdout_level must be one of error|warn|info|debug|trace, got '{}'",
+                self.logging.stdout_level
             );
         }
 
-        if self.status_dump.enabled {
-            let label = non_empty(self.status_dump.disk_label.as_deref());
-            let path = non_empty(self.status_dump.disk_path.as_deref());
+        if self.companion.enabled {
+            let label = non_empty(self.companion.disk_label.as_deref());
+            let path = non_empty(self.companion.disk_path.as_deref());
             match (label, path) {
                 (Some(_), Some(_)) => {
                     bail!("status-dump: specify only one of disk_label or disk_path, not both")
@@ -222,14 +238,12 @@ impl Config {
                 _ => {}
             }
 
-            let file_name = self.status_dump.file_name.trim();
+            let file_name = self.companion.file_name.trim();
             if file_name.is_empty() {
                 bail!("status-dump.file_name must not be empty");
             }
             if file_name.contains(['/', '\\']) || file_name == "." || file_name == ".." {
-                bail!(
-                    "status-dump.file_name must be a plain file name, not a path: '{file_name}'"
-                );
+                bail!("status-dump.file_name must be a plain file name, not a path: '{file_name}'");
             }
         }
 
@@ -281,7 +295,8 @@ band = "Auto"
 uplink_adapter = "Ethernet"
 
 [logging]
-level = "info"
+file_level = "warn"
+stdout_level = "debug"
 path = "autospot.log"
 "#;
 
@@ -295,7 +310,8 @@ path = "autospot.log"
         assert_eq!(cfg.hotspot.passphrase, "changeme123");
         assert_eq!(cfg.hotspot.band, Band::Auto);
         assert_eq!(cfg.hotspot.uplink_adapter, "Ethernet");
-        assert_eq!(cfg.logging.level, "info");
+        assert_eq!(cfg.logging.file_level, "warn");
+        assert_eq!(cfg.logging.stdout_level, "debug");
         assert_eq!(cfg.logging.path, PathBuf::from("autospot.log"));
     }
 
@@ -413,7 +429,7 @@ uplink_adapter = "Ethernet"
     }
 
     #[test]
-    fn rejects_unknown_log_level() {
+    fn rejects_unknown_file_log_level() {
         let err = Config::from_toml(
             r#"
 [hotspot]
@@ -422,11 +438,46 @@ passphrase = "password1"
 uplink_adapter = "Ethernet"
 
 [logging]
-level = "verbose"
+file_level = "verbose"
 "#,
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("logging.level"), "{err:#}");
+        assert!(format!("{err:#}").contains("logging.file_level"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_unknown_stdout_log_level() {
+        let err = Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+
+[logging]
+stdout_level = "verbose"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("logging.stdout_level"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn logging_levels_default_to_error_for_file_and_info_for_stdout() {
+        let cfg = Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.logging.file_level, "error");
+        assert_eq!(cfg.logging.stdout_level, "info");
     }
 
     #[test]
@@ -450,15 +501,17 @@ uplink_adapter = "{value}"
 
     #[test]
     fn rejects_empty_uplink_adapter() {
-        assert!(Config::from_toml(
-            r#"
+        assert!(
+            Config::from_toml(
+                r#"
 [hotspot]
 ssid = "Fallback"
 passphrase = "password1"
 uplink_adapter = "   "
 "#,
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -471,11 +524,11 @@ uplink_adapter = "   "
     #[test]
     fn status_dump_defaults_to_disabled() {
         let cfg = Config::from_toml(FULL).unwrap();
-        assert_eq!(cfg.status_dump, StatusDumpConfig::default());
-        assert!(!cfg.status_dump.enabled);
-        assert_eq!(cfg.status_dump.file_name, "status.json");
-        assert_eq!(cfg.status_dump.disk_label, None);
-        assert_eq!(cfg.status_dump.disk_path, None);
+        assert_eq!(cfg.companion, CompanionConfig::default());
+        assert!(!cfg.companion.enabled);
+        assert_eq!(cfg.companion.file_name, "status.json");
+        assert_eq!(cfg.companion.disk_label, None);
+        assert_eq!(cfg.companion.disk_path, None);
     }
 
     #[test]
@@ -494,10 +547,10 @@ file_name = "status.json"
 "#,
         )
         .unwrap();
-        assert!(cfg.status_dump.enabled);
-        assert_eq!(cfg.status_dump.disk_label.as_deref(), Some("CIRCUITPY"));
-        assert_eq!(cfg.status_dump.disk_path, None);
-        assert_eq!(cfg.status_dump.file_name, "status.json");
+        assert!(cfg.companion.enabled);
+        assert_eq!(cfg.companion.disk_label.as_deref(), Some("CIRCUITPY"));
+        assert_eq!(cfg.companion.disk_path, None);
+        assert_eq!(cfg.companion.file_name, "status.json");
     }
 
     #[test]
@@ -515,16 +568,17 @@ disk_path = "E:\\"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.status_dump.disk_path.as_deref(), Some("E:\\"));
+        assert_eq!(cfg.companion.disk_path.as_deref(), Some("E:\\"));
         // file_name still defaults even though the section is present.
-        assert_eq!(cfg.status_dump.file_name, "status.json");
+        assert_eq!(cfg.companion.file_name, "status.json");
     }
 
     #[test]
     fn status_dump_disabled_does_not_require_a_location() {
         // enabled defaults to false, so an empty [status-dump] section is fine.
-        assert!(Config::from_toml(
-            r#"
+        assert!(
+            Config::from_toml(
+                r#"
 [hotspot]
 ssid = "Fallback"
 passphrase = "password1"
@@ -532,8 +586,9 @@ uplink_adapter = "Ethernet"
 
 [status-dump]
 "#,
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -569,7 +624,10 @@ enabled = true
 "#,
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("disk_label or disk_path"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("disk_label or disk_path"),
+            "{err:#}"
+        );
     }
 
     #[test]

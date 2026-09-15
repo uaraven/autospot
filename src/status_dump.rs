@@ -9,13 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
-use windows::core::HSTRING;
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
 use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
+use windows::core::HSTRING;
 
-use crate::config::StatusDumpConfig;
+use crate::config::CompanionConfig;
 
 /// SSID placeholder for a "connected" report that is not backed by a readable Wi-Fi
 /// SSID. Autospot only ever monitors Wi-Fi (`wlanapi` has no concept of Ethernet), so in
@@ -108,7 +108,11 @@ pub struct HotspotSnapshot<'a> {
 ///
 /// Priority when both could apply: a real Wi-Fi connection always wins over a hotspot
 /// that has not been torn down yet (mirrors the watchdog's own reconnect handling).
-pub fn compute(wifi_ok: bool, wifi: &WifiSnapshot, hotspot: Option<&HotspotSnapshot>) -> StatusDump {
+pub fn compute(
+    wifi_ok: bool,
+    wifi: &WifiSnapshot,
+    hotspot: Option<&HotspotSnapshot>,
+) -> StatusDump {
     if !wifi_ok {
         return StatusDump::unknown();
     }
@@ -129,7 +133,7 @@ pub fn compute(wifi_ok: bool, wifi: &WifiSnapshot, hotspot: Option<&HotspotSnaps
 /// Resolves the target disk fresh on every call (see `resolve_root`) so a drive that was
 /// unplugged and replugged -- possibly under a different letter -- is still found.
 pub fn write_if_changed(
-    cfg: &StatusDumpConfig,
+    cfg: &CompanionConfig,
     dump: &StatusDump,
     last: &mut Option<StatusDump>,
 ) -> Result<bool> {
@@ -147,7 +151,7 @@ pub fn write_if_changed(
 
 /// Resolve `disk_label` or `disk_path` (config validation guarantees exactly one is set)
 /// to a root directory to write into.
-fn resolve_root(cfg: &StatusDumpConfig) -> Result<PathBuf> {
+fn resolve_root(cfg: &CompanionConfig) -> Result<PathBuf> {
     if let Some(path) = non_empty(cfg.disk_path.as_deref()) {
         return Ok(PathBuf::from(path));
     }
@@ -210,7 +214,7 @@ fn wide_to_string(buf: &[u16]) -> String {
 /// Write via a temp file + rename so a reader polling the file never sees a partial
 /// write. `std::fs::rename` on Windows replaces an existing destination.
 fn write_atomically(target: &Path, dump: &StatusDump) -> Result<()> {
-    let json = serde_json::to_vec_pretty(dump).context("serializing status dump")?;
+    let json = serde_json::to_vec_pretty(dump).context("serializing companion status")?;
 
     let tmp_name = format!(
         "{}.tmp",
@@ -221,8 +225,7 @@ fn write_atomically(target: &Path, dump: &StatusDump) -> Result<()> {
     );
     let tmp_path = target.with_file_name(tmp_name);
 
-    std::fs::write(&tmp_path, &json)
-        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, &json).with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, target)
         .with_context(|| format!("renaming {} to {}", tmp_path.display(), target.display()))?;
     Ok(())
@@ -248,7 +251,11 @@ mod tests {
         }
     }
 
-    fn hotspot_on<'a>(ssid: &'a str, password: &'a str, ip: Option<&'a str>) -> HotspotSnapshot<'a> {
+    fn hotspot_on<'a>(
+        ssid: &'a str,
+        password: &'a str,
+        ip: Option<&'a str>,
+    ) -> HotspotSnapshot<'a> {
         HotspotSnapshot {
             on: true,
             ssid,
@@ -281,7 +288,11 @@ mod tests {
 
     #[test]
     fn connected_wifi_reports_ssid_and_ip() {
-        let dump = compute(true, &wifi_connected(Some("home"), Some("192.168.1.2")), None);
+        let dump = compute(
+            true,
+            &wifi_connected(Some("home"), Some("192.168.1.2")),
+            None,
+        );
         assert_eq!(dump.status, "connected");
         assert_eq!(
             dump.connected,
@@ -310,7 +321,11 @@ mod tests {
         let dump = compute(
             true,
             &wifi_disconnected(),
-            Some(&hotspot_on("MyFallbackHotspot", "changeme123", Some("192.168.137.1"))),
+            Some(&hotspot_on(
+                "MyFallbackHotspot",
+                "changeme123",
+                Some("192.168.137.1"),
+            )),
         );
         assert_eq!(dump.status, "hotspot");
         assert_eq!(
@@ -360,13 +375,13 @@ mod tests {
 
     #[test]
     fn only_one_of_connected_or_hotspot_is_ever_serialized() {
-        let connected = serde_json::to_value(&StatusDump::connected(Some("home"), Some("1.2.3.4")))
-            .unwrap();
+        let connected =
+            serde_json::to_value(&StatusDump::connected(Some("home"), Some("1.2.3.4"))).unwrap();
         assert!(connected.get("connected").is_some());
         assert!(connected.get("hotspot").is_none());
 
-        let hotspot = serde_json::to_value(&StatusDump::hotspot("AP", "pw", Some("1.2.3.4")))
-            .unwrap();
+        let hotspot =
+            serde_json::to_value(&StatusDump::hotspot("AP", "pw", Some("1.2.3.4"))).unwrap();
         assert!(hotspot.get("hotspot").is_some());
         assert!(hotspot.get("connected").is_none());
     }
@@ -375,7 +390,7 @@ mod tests {
     fn write_if_changed_skips_a_write_when_nothing_changed() {
         let dir = std::env::temp_dir().join(format!("autospot-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = StatusDumpConfig {
+        let cfg = CompanionConfig {
             enabled: true,
             disk_label: None,
             disk_path: Some(dir.to_string_lossy().into_owned()),
@@ -408,7 +423,7 @@ mod tests {
 
     #[test]
     fn resolve_root_uses_disk_path_directly_without_touching_windows_apis() {
-        let cfg = StatusDumpConfig {
+        let cfg = CompanionConfig {
             enabled: true,
             disk_label: None,
             disk_path: Some("Z:\\some\\path".to_string()),
