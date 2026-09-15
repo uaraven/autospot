@@ -2,9 +2,12 @@
 # Part of the Autospot companion; see LICENSE.
 
 import hal
+import sys
 import json
+import supervisor
+import time
 
-
+    
 maingroup = hal.initialize_display()
 
 
@@ -39,5 +42,27 @@ else:
 
 hal.show_info(display)
 
+input_buffer = ""
 while True:
-    pass
+    if supervisor.runtime.serial_bytes_available:
+            # Read available characters from standard input
+            raw_data = sys.stdin.read(supervisor.runtime.serial_bytes_available)
+            input_buffer += raw_data
+
+            # Process complete lines terminated by a newline character (\n)
+            while "\n" in input_buffer:
+                line, input_buffer = input_buffer.split("\n", 1)
+                line = line.strip()  # Remove \r or trailing whitespace
+                
+                if line:
+                    # --- PROCESS YOUR DATA HERE ---
+                    print(f"Received Command: '{line}'")
+                    
+                    # Example action based on received string
+                    if line == "LED_ON":
+                        display['status'] = "disconnected"
+                        hal.show_info(display)
+                        pass
+
+    # Small delay to keep the system responsive
+    time.sleep(0.1)
