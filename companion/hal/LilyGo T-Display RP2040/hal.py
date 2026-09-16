@@ -36,7 +36,11 @@ def show_info(items):
         _add_line(items["password"], 95)
         _add_line("IP: " + items["ip_address"], 120)
     elif items['status'] == "disconnected":
-        _add_line("   Disconnected", 65)
+        if 'time' in items:
+            _add_line("   Disconnected", 50)
+            _add_line("     Time: " + items['time'] + "s", 75)
+        else:
+            _add_line("   Disconnected", 65)
     else:
         _add_line("   Unknown state", 65)
     _display.refresh()

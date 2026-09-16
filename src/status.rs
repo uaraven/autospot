@@ -40,13 +40,11 @@ impl Status {
             elements.insert("s", "connected".to_string());
             elements.insert("i", wifi.ssid.unwrap_or("N/A").to_string());
             elements.insert("a", wifi.ip_address.unwrap_or("N/A").to_string());
-        } else if let Some(h) = hotspot {
-            if h.on {
-                elements.insert("s", "hotspot".to_string());
-                elements.insert("i", h.ssid.to_string());
-                elements.insert("p", h.password.to_string());
-                elements.insert("a", h.ip_address.unwrap_or("N/A").to_string());
-            }
+        } else if let Some(h) = hotspot && h.on {
+            elements.insert("s", "hotspot".to_string());
+            elements.insert("i", h.ssid.to_string());
+            elements.insert("p", h.password.to_string());
+            elements.insert("a", h.ip_address.unwrap_or("N/A").to_string());
         } else {
             elements.insert("s", "disconnected".to_string());
         }

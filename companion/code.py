@@ -16,7 +16,6 @@ status = {
 
 
 input_buffer = ""
-updated = True
 while True:
     if supervisor.runtime.serial_bytes_available:
             # Read available characters from standard input
@@ -37,22 +36,17 @@ while True:
                     # Example action based on received string
                     if cmd == "s":
                         status['status'] = payload
-                        updated = True
                     elif cmd == "i":
                         status['ssid'] = payload
-                        updated = True
                     elif cmd == "p":
                         status['password'] = payload
-                        updated = True
                     elif cmd == "a":
                         status['ip_address'] = payload
-                        updated = True
                     elif cmd == "m":
                         status['message'] = payload
-                        updated = True
+                    elif cmd == "t":
+                        status['time'] = payload
 
-    if updated:
-        hal.show_info(status)
-        updated = False
+    hal.show_info(status)
     # Small delay to keep the system responsive
     time.sleep(0.1)
