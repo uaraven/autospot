@@ -1,9 +1,8 @@
 import supervisor
 
-# Set custom USB string descriptors
-# In case autospot cannot connect to the device
-# uncomment VID and PID settings and
-# configure vid and pid in autospot.toml
+# Sets custom USB string descriptors and VID/PID values
+# In case autospot cannot connect to the device ensure that vid and pid in autospot.toml match these values
+# In case of conflict with another device, chose different PID and update it here and in autospot.toml
 supervisor.set_usb_identification(
     manufacturer="autospot",
     product="companion",
