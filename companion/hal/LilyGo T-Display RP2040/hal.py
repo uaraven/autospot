@@ -8,6 +8,7 @@ from adafruit_display_text import label
 
 SCALE = 2
 _main_group = None
+_display = None
 
 RED = 0xFF0000
 
@@ -22,7 +23,7 @@ def _add_line(text, y):
 
 def show_info(items):
     _clear_group()
-            
+
     if items['status'] == "connected":
         _add_line("Network connected", 20)
         _add_line("SSID:", 55)
@@ -35,9 +36,14 @@ def show_info(items):
         _add_line(items["password"], 95)
         _add_line("IP: " + items["ip_address"], 120)
     elif items['status'] == "disconnected":
-        _add_line("   Disconnected", 65)
+        if 'time' in items:
+            _add_line("   Disconnected", 50)
+            _add_line("     Time: " + items['time'] + "s", 75)
+        else:
+            _add_line("   Disconnected", 65)
     else:
         _add_line("   Unknown state", 65)
+    _display.refresh()
 
 
 def initialize_display():
@@ -53,11 +59,12 @@ def initialize_display():
 
     tft_spi = busio.SPI(clock=tft_clk, MOSI=tft_mosi)
     display_bus = fourwire.FourWire(tft_spi, command=tft_dc, chip_select=tft_cs, reset=tft_rst)
-    display = adafruit_st7789.ST7789(display_bus,
+    global _display, _main_group
+    _display = adafruit_st7789.ST7789(display_bus,
                                     width=135, height=240,
                                     rowstart=40, colstart=53,
                                     backlight_pin=tft_bl)
-    display.rotation=270
-    global _main_group
+    _display.rotation=270
+    _display.auto_refresh = False
     _main_group = displayio.Group()
-    display.root_group = _main_group
+    _display.root_group = _main_group

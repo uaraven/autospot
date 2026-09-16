@@ -37,15 +37,17 @@ band = "Auto"
 uplink_adapter = "auto"
 
 [companion]
-# Enables integration with  companion microcontroller monitor
+# Enables sending Wi-Fi/hotspot status to a companion microcontroller over serial.
+# The device is found automatically by its USB manufacturer/product strings; no port
+# needs to be configured, and it is safe to leave this on even when nothing is plugged in.
 enabled = true
-# Find the disk with the label and write status to the file.
-disk_label = "AUTOSPOT"
-# Alternatively, you can specify a path to a directory on any disk. The file is
-# disk_path = "E:\\"
-# File name to write the status JSON to. File is always written to the root of the disk.
-file_name = "status.json"
 
+# If the device is not detected automatically, configure the USB vendor ID and Product ID
+# to match the VID&PID of your microcontroller board (you can find this in Device manager)
+# You can also uncommed custom VID&PID setting in boot.py in the controller firmware
+# and make sure that VID&PID in boot.py and here match
+vid=0x1209
+pid=0x3a01
 
 [logging]
 # error | warn | info | debug | trace

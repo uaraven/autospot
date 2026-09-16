@@ -1,5 +1,5 @@
 //! The watchdog loop: polls Wi-Fi state every tick, drives the hotspot on and off in
-//! response, and prints the console status line and optional companion status dump.
+//! response, and prints the console status line and optional companion status update.
 
 use std::path::Path;
 use std::time::Instant;
@@ -8,9 +8,10 @@ use anyhow::Result;
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::{self, Adapter};
+use crate::companion::CompanionConn;
 use crate::config::Config;
 use crate::hotspot::{Hotspot, State};
-use crate::status_dump;
+use crate::status::{self, Status};
 use crate::watchdog::{Intent, Watchdog};
 use crate::wifi;
 
@@ -32,36 +33,44 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
         cfg.monitor.auto_disable_on_reconnect,
     );
     let ignore_ssid = Some(cfg.hotspot.ssid.as_str());
-    // Last dump written, so `[status-dump]` only writes on an actual change.
-    let mut last_dump: Option<status_dump::StatusDump> = None;
+    // What was last sent to the companion, so only the changed fields need re-sending.
+    let mut last_status = Status::default();
+    // When the "s" field last actually changed, so outgoing updates can tell the
+    // companion how long the current state has held.
+    let mut last_state_change = Instant::now();
+    let mut log_missing_companion = true;
 
     loop {
         let now = Instant::now();
 
         let (wifi_ok, status) = match wifi::query() {
             Ok(status) => (true, status),
-            // Treat an unreadable Wi-Fi stack as "state unknown": still worth a status
-            // dump (status="unknown"), but not worth feeding a guess into the watchdog.
+            // Treat an unreadable Wi-Fi stack as "state unknown": still worth a companion
+            // status update (status="unknown"), but not worth feeding a guess into the watchdog.
             Err(e) => {
                 warn!("could not read Wi-Fi state: {e:#}");
                 (false, wifi::WifiStatus::default())
             }
         };
 
-        // Best-effort snapshots shared by the console status line and the status dump; a
-        // failure here (e.g. a transient IP Helper hiccup) should never stop the loop.
+        // Best-effort snapshots shared by the console status line and the companion
+        // status update; a failure here (e.g. a transient IP Helper hiccup) should never
+        // stop the loop.
         let adapters_snapshot = adapters::list().unwrap_or_default();
         let live_hotspot = query_hotspot(cfg);
 
         if cfg.companion.enabled {
-            dump_status(
+            update_companion_status(
                 cfg,
+                now,
                 wifi_ok,
                 &status,
                 ignore_ssid,
                 &adapters_snapshot,
                 &live_hotspot,
-                &mut last_dump,
+                &mut last_status,
+                &mut last_state_change,
+                &mut log_missing_companion,
             );
         }
 
@@ -124,42 +133,66 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
     }
 }
 
-/// Compute this tick's `[status-dump]` document and write it if it changed. Errors
-/// (most commonly: `disk_label` not currently found) are logged and otherwise ignored --
-/// per the config's contract, a dump that cannot be written is skipped, not fatal.
-fn dump_status(
+/// Compute this tick's status and send only what changed since `last_status` to the
+/// companion microcontroller over serial, tagged with "t": seconds since the "s" field
+/// itself last changed -- e.g. how long Wi-Fi has been disconnected. Resolves the serial
+/// port fresh on every call (see `CompanionConn::new`) so a companion that is unplugged
+/// and replugged -- possibly under a different COM port -- is still found. Updates
+/// `last_status`/`last_state_change` on every call, even when there is no companion to
+/// send to, so both stay accurate for whenever one shows up.
+fn update_companion_status(
     cfg: &Config,
+    now: Instant,
     wifi_ok: bool,
     status: &wifi::WifiStatus,
     ignore_ssid: Option<&str>,
     adapters: &[Adapter],
     live_hotspot: &Option<LiveHotspot>,
-    last_dump: &mut Option<status_dump::StatusDump>,
+    last_status: &mut Status,
+    last_state_change: &mut Instant,
+    log_missing_companion: &mut bool,
 ) {
     let wifi_snapshot = match status.active_interface(ignore_ssid) {
-        Some(iface) => status_dump::WifiSnapshot {
+        Some(iface) => status::WifiSnapshot {
+            wifi_ok,
             connected: true,
             ssid: iface.ssid.as_deref(),
             ip_address: adapters::ipv4_of(adapters, &iface.description),
         },
-        None => status_dump::WifiSnapshot {
+        None => status::WifiSnapshot {
+            wifi_ok,
             connected: false,
             ssid: None,
             ip_address: None,
         },
     };
-    let hotspot_snapshot = live_hotspot.as_ref().map(|h| status_dump::HotspotSnapshot {
+    let hotspot_snapshot = live_hotspot.as_ref().map(|h| status::HotspotSnapshot {
         on: h.state == State::On,
         ssid: &cfg.hotspot.ssid,
         password: &cfg.hotspot.passphrase,
         ip_address: adapters::hotspot_ip(adapters),
     });
 
-    let dump = status_dump::compute(wifi_ok, &wifi_snapshot, hotspot_snapshot.as_ref());
-    match status_dump::write_if_changed(&cfg.companion, &dump, last_dump) {
-        Ok(true) => info!(status = dump.status, "companion status written"),
-        Ok(false) => {}
-        Err(e) => error!("could not write status to companion: {e:#}"),
+    let new_status = Status::new(&wifi_snapshot, hotspot_snapshot.as_ref());
+    let changed = new_status.diff(last_status);
+    *last_status = new_status;
+
+    if changed.contains_key("s") {
+        *last_state_change = now;
+    }
+    let since_state_change = now.duration_since(*last_state_change).as_secs();
+    let to_send = last_status.with_field("t", since_state_change.to_string());
+
+    let Some(companion) = CompanionConn::new(cfg.companion) else {
+        if *log_missing_companion {
+            warn!("no companion device found");
+            *log_missing_companion = false;
+        }
+        return;
+    };
+    *log_missing_companion = true;
+    if let Err(e) = companion.write_status(&to_send) {
+        error!("could not send status to companion: {e:#}");
     }
 }
 
@@ -208,7 +241,7 @@ fn wifi_status_text(
 }
 
 /// Live hotspot state, queried once per tick and shared by the console status line and
-/// the `[status-dump]` computation so neither reads Windows twice.
+/// the companion status update so neither reads Windows twice.
 struct LiveHotspot {
     state: State,
     ssid: String,
