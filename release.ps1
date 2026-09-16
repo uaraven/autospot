@@ -40,7 +40,7 @@ $companionPaths = @(
     "$companionDir\code.py",
     "$companionDir\LICENSE",
     "$companionDir\install.txt",
-    "$companionDir\hal"
+    "$companionDir\board"
 )
 foreach ($path in $companionPaths) {
     if (-not (Test-Path $path)) { throw "Missing $path" }
