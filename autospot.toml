@@ -17,7 +17,7 @@ auto_disable_on_reconnect = true
 
 [hotspot]
 # Network name broadcast by the hotspot. Max 32 bytes.
-ssid = "MyFallbackHotspot"
+ssid = "AutoHotspot"
 
 # WPA2 passphrase. Must be 8-63 characters.
 passphrase = "changeme123"

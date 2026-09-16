@@ -39,13 +39,17 @@ Available keys:
  - "password" - the password to the hotspot network
  - "ip_address" - the IP address of the computer
 
-### Disconnected and unknown statuses
+### Disconnected status
 
-No other keys are available.
+ - "time" - the time in seconds since disconnect. This key is optional, the code must handle the absense of this key.
+
+### Unknown status
+
+No additional keys are available for this status.
 
 ## Implementation notes
 
-The code runs only once when the controller starts. Every time the status is updated, the controller is reset and the main code in `code.py` runs again, calling each of the HAL's functions once.
+The code runs constantly and updates the screen every several seconds. HAL writer should take care to ensure that display is refreshed without unnecessary flickering.
 
 When implementing the `show_info` function, keep in mind the use case - indicating network status of the NINA computer to astrophotographers. Display information in the simplest and most readable format, and use red colour to preserve the user's night vision. Avoid bright lights (i.e. don't use bright LEDs even if the board has the best LEDs in the world).
 

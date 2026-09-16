@@ -3,7 +3,6 @@
 
 import hal
 import sys
-import json
 import supervisor
 import time
 

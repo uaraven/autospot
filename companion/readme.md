@@ -23,11 +23,12 @@ See [below](#supported-boards) for the list of tested boards.
 ## Installation
 
 Install [CircuitPython](https://circuitpython.org/downloads) version 10 onto your microcontroller and then copy `code.py` and `boot.py` files to the CIRCUITPY drive.
-In the `hal` directory select the folder corresponding to your microcontroller and copy `hal.py` file and `lib` folder to the CIRCUITPY drive as well.
+In the `board` directory select the folder corresponding to your microcontroller and copy all files and folders to the CIRCUITPY drive as well. There usually will be `hal.py` and `lib` folders, but there might be other files and folders, copy everything.
 **Note**: All the files must be copied to the root of the CIRCUITPY drive. After copying, unmount the disk, disconnect it and then reconnect it back again.
-You should now see AUTOSPOT disk drive.
 
-Run autospot - the status of the connection should be displayed on the controller's display. If you change the drive label from CIRCUITPY to something else, don't forget to edit the autospot.toml file and update the label name.
+Run autospot - the status of the connection should be displayed on the controller's display. 
+
+If autospot's logs shows "no companion device found", you might need to change the configuration of the USB device, refer to [companion installation guide](install.txt) for more details.
 
 ## Limitations
 

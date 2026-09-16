@@ -98,13 +98,13 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
             Intent::WifiLost => {
                 info!(
                     threshold_secs = cfg.monitor.disconnect_threshold_secs,
-                    "wi-fi disconnected; starting countdown"
+                    "Wi-Fi disconnected; starting countdown"
                 );
             }
             Intent::StartHotspot { down_for } => {
                 info!(
                     down_for_secs = down_for.as_secs(),
-                    "wi-fi has been down past the threshold; bringing the hotspot up"
+                    "Wi-Fi has been down past the threshold; bringing the hotspot up"
                 );
                 if let Err(e) = try_start(cfg, &mut watchdog) {
                     error!("could not start the hotspot: {e:#}");
@@ -118,7 +118,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
                 info!(
                     down_for_secs = down_for.as_secs(),
                     ssid = ?status.connected_ssid(ignore_ssid),
-                    "wi-fi reconnected"
+                    "Wi-Fi reconnected"
                 );
                 if stop_hotspot {
                     if let Err(e) = try_stop(cfg, &mut watchdog) {
