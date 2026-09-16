@@ -1,15 +1,42 @@
-Autospot Companion Installation
+Autospot Companion - Installation
 
-Install CircuitPython(https://circuitpython.org/downloads) version 10 onto your microcontroller. Follow instructions on circuitpython page for your board to complete installation/
+1. Install CircuitPython (https://circuitpython.org/downloads), version 10, onto your
+   microcontroller. Follow the instructions on the CircuitPython page for your board to
+   complete the installation.
 
-Connect the board to the computer - the CIRCUITPY disk drive should appear in the explorer.
+2. Connect the board to the computer. The CIRCUITPY disk drive should appear in File
+   Explorer.
 
-Copy code.py and boot.py files to the root of CIRCUITPY drive.
+3. Copy the code.py and boot.py files to the root of the CIRCUITPY drive.
 
-In the hal directory find the folder corresponding to your board model and copy hal.py file and lib folder to the CIRCUITPY drive as well.
+4. In the hal directory, find the folder corresponding to your board model, and copy its
+   hal.py file and lib folder to the CIRCUITPY drive as well.
 
-After copying, unmount the disk, disconnect it and then reconnect it back again.
+5. Unmount the disk, disconnect the device, and then reconnect it.
 
-The CIRCUITPY drive should disappear and you should now see AUTOSPOT disk drive in Explorer.
+6. Run Autospot. The connection status should now appear on the board's display.
 
-Run autospot - the status of the connection should be displayed on the controller's display.
+Troubleshooting: device not found
+
+If Autospot's logs show "no companion device found", the device's VID and PID (Vendor ID
+and Product ID) don't match the values Autospot expects. To find and configure the
+correct ones:
+
+1. Open Device Manager and go to "Ports (COM & LPT)". Find the entry for the companion
+   board - it will be named "USB Serial Device (COMxx)". If several USB serial devices
+   are listed, either disconnect the others or identify the right one by trial and
+   error.
+
+2. Right-click the device, select "Properties", open the "Details" tab, and choose
+   "Hardware Ids" from the dropdown. You'll see a string such as
+   "USB\VID_1209&PID_2023&MI_00".
+
+3. Add the vid and pid values to the [companion] section of autospot.toml, prefixing
+   each with "0x" (e.g. VID_1209 becomes 0x1209):
+
+   [companion]
+   enabled = true
+   vid = 0x1209
+   pid = 0x2023
+
+4. Restart Autospot.
