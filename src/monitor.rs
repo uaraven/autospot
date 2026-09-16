@@ -35,6 +35,10 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
     let ignore_ssid = Some(cfg.hotspot.ssid.as_str());
     // What was last sent to the companion, so only the changed fields need re-sending.
     let mut last_status = Status::default();
+    // When the "s" field last actually changed, so outgoing updates can tell the
+    // companion how long the current state has held.
+    let mut last_state_change = Instant::now();
+    let mut log_missing_companion = true;
 
     loop {
         let now = Instant::now();
@@ -58,12 +62,15 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
         if cfg.companion.enabled {
             update_companion_status(
                 cfg,
+                now,
                 wifi_ok,
                 &status,
                 ignore_ssid,
                 &adapters_snapshot,
                 &live_hotspot,
                 &mut last_status,
+                &mut last_state_change,
+                &mut log_missing_companion,
             );
         }
 
@@ -127,19 +134,23 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
 }
 
 /// Compute this tick's status and send only what changed since `last_status` to the
-/// companion microcontroller over serial. Resolves the serial port fresh on every call
-/// (see `CompanionConn::new`) so a companion that is unplugged and replugged -- possibly
-/// under a different COM port -- is still found. Updates `last_status` on every call,
-/// even when there is no companion to send to, so the diff stays accurate for whenever
-/// one shows up.
+/// companion microcontroller over serial, tagged with "t": seconds since the "s" field
+/// itself last changed -- e.g. how long Wi-Fi has been disconnected. Resolves the serial
+/// port fresh on every call (see `CompanionConn::new`) so a companion that is unplugged
+/// and replugged -- possibly under a different COM port -- is still found. Updates
+/// `last_status`/`last_state_change` on every call, even when there is no companion to
+/// send to, so both stay accurate for whenever one shows up.
 fn update_companion_status(
     cfg: &Config,
+    now: Instant,
     wifi_ok: bool,
     status: &wifi::WifiStatus,
     ignore_ssid: Option<&str>,
     adapters: &[Adapter],
     live_hotspot: &Option<LiveHotspot>,
     last_status: &mut Status,
+    last_state_change: &mut Instant,
+    log_missing_companion: &mut bool,
 ) {
     let wifi_snapshot = match status.active_interface(ignore_ssid) {
         Some(iface) => status::WifiSnapshot {
@@ -166,15 +177,21 @@ fn update_companion_status(
     let changed = new_status.diff(last_status);
     *last_status = new_status;
 
-    if changed.is_empty() {
-        return;
+    if changed.contains_key("s") {
+        *last_state_change = now;
     }
+    let since_state_change = now.duration_since(*last_state_change).as_secs();
+    let to_send = last_status.with_field("t", since_state_change.to_string());
 
     let Some(companion) = CompanionConn::new(cfg.companion) else {
-        debug!("no companion device found; skipping this tick's status update");
+        if *log_missing_companion {
+            warn!("no companion device found");
+            *log_missing_companion = false;
+        }
         return;
     };
-    if let Err(e) = companion.write_status(&changed) {
+    *log_missing_companion = true;
+    if let Err(e) = companion.write_status(&to_send) {
         error!("could not send status to companion: {e:#}");
     }
 }

@@ -68,9 +68,20 @@ impl Status {
         Status::new_from(output)
     }
 
-    /// Is there anything to report? Empty for an unchanged tick's diff.
-    pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+    /// Does this status carry a new value for `key`? Used to tell whether a diff
+    /// touched the state field ("s") specifically, e.g. to reset a since-last-change
+    /// timer only on an actual state transition.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.elements.contains_key(key)
+    }
+
+    /// A copy of this status with `key` set to `value` -- for attaching a side-channel
+    /// field (like time since the last state change) that isn't part of the diffed
+    /// state itself, just before sending.
+    pub fn with_field(&self, key: &'static str, value: impl Into<String>) -> Status {
+        let mut elements = self.elements.clone();
+        elements.insert(key, value.into());
+        Status::new_from(elements)
     }
 
     pub fn as_elements(&self) -> Vec<String> {
@@ -103,7 +114,11 @@ mod tests {
         }
     }
 
-    fn hotspot_on<'a>(ssid: &'a str, password: &'a str, ip: Option<&'a str>) -> HotspotSnapshot<'a> {
+    fn hotspot_on<'a>(
+        ssid: &'a str,
+        password: &'a str,
+        ip: Option<&'a str>,
+    ) -> HotspotSnapshot<'a> {
         HotspotSnapshot {
             on: true,
             ssid,
@@ -122,7 +137,10 @@ mod tests {
     fn wifi_query_failure_reports_unknown_regardless_of_everything_else() {
         let mut unknown = wifi_connected(Some("home"), Some("192.168.1.2"));
         unknown.wifi_ok = false;
-        let status = Status::new(&unknown, Some(&hotspot_on("AP", "pw", Some("192.168.137.1"))));
+        let status = Status::new(
+            &unknown,
+            Some(&hotspot_on("AP", "pw", Some("192.168.137.1"))),
+        );
         assert_eq!(elements_of(&status), vec!["s:unknown".to_string()]);
     }
 
@@ -131,7 +149,11 @@ mod tests {
         let status = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
         assert_eq!(
             elements_of(&status),
-            vec!["a:192.168.1.2".to_string(), "i:home".to_string(), "s:connected".to_string()]
+            vec![
+                "a:192.168.1.2".to_string(),
+                "i:home".to_string(),
+                "s:connected".to_string()
+            ]
         );
     }
 
@@ -159,17 +181,13 @@ mod tests {
     }
 
     #[test]
-    fn diff_is_empty_when_nothing_changed() {
-        let a = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
-        let b = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
-        assert!(a.diff(&b).is_empty());
-    }
-
-    #[test]
     fn diff_reports_only_the_fields_that_changed() {
         let old = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
         let new = Status::new(&wifi_connected(Some("home"), Some("192.168.1.3")), None);
-        assert_eq!(elements_of(&new.diff(&old)), vec!["a:192.168.1.3".to_string()]);
+        assert_eq!(
+            elements_of(&new.diff(&old)),
+            vec!["a:192.168.1.3".to_string()]
+        );
     }
 
     #[test]
@@ -181,5 +199,25 @@ mod tests {
         let changed = new.diff(&old);
         assert!(!changed.as_elements().contains(&"p:pw".to_string()));
         assert!(changed.as_elements().contains(&"s:connected".to_string()));
+    }
+
+    #[test]
+    fn diff_contains_key_reports_whether_the_state_field_changed() {
+        let old = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
+        let new = Status::new(&wifi_connected(Some("home"), Some("192.168.1.3")), None);
+        assert!(!new.diff(&old).contains_key("s"));
+
+        let disconnected = Status::new(&wifi_disconnected(), None);
+        assert!(disconnected.diff(&old).contains_key("s"));
+    }
+
+    #[test]
+    fn with_field_attaches_a_side_channel_value_without_touching_the_rest() {
+        let status = Status::new(&wifi_connected(Some("home"), Some("192.168.1.2")), None);
+        let tagged = status.with_field("t", "42");
+        assert!(tagged.as_elements().contains(&"t:42".to_string()));
+        // The original is untouched -- with_field returns a copy.
+        assert!(!status.as_elements().contains(&"t:42".to_string()));
+        assert_eq!(tagged.as_elements().len(), status.as_elements().len() + 1);
     }
 }
