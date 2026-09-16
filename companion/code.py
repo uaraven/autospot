@@ -4,22 +4,9 @@
 import hal
 import sys
 import json
-import usb_hid
 import supervisor
 import time
 
-
-# Find custom device
-custom_dev = None
-for dev in usb_hid.devices:
-    if dev.usage_page == 0xFF00:
-        custom_dev = dev
-        break
-
-# if custom_dev is None:
-#     print("No custom device found")
-# else:
-#     print("Custom device found:", custom_dev)
 
 maingroup = hal.initialize_display()
 
