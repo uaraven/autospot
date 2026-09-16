@@ -4,45 +4,32 @@
 import hal
 import sys
 import json
+import usb_hid
 import supervisor
 import time
 
-    
+
+# Find custom device
+custom_dev = None
+for dev in usb_hid.devices:
+    if dev.usage_page == 0xFF00:
+        custom_dev = dev
+        break
+
+# if custom_dev is None:
+#     print("No custom device found")
+# else:
+#     print("Custom device found:", custom_dev)
+
 maingroup = hal.initialize_display()
 
+status = {
+    'status': "no-data"
+}
 
-def read_status():
-    try:
-        with open("status.json", "r") as f:
-            return json.load(f)
-    except Exception as e:
-        print("Error reading status.json:", e)
-        return {"status": "unknown"}
-    
-
-status = read_status()
-display = {}
-if status['status'] == "connected":
-    display = {
-        'status': "connected",
-        'ssid': status['connected']['ssid'],
-        'ip_address': status['connected']['ip_address']
-    }
-elif status['status'] == "hotspot":
-    display= {
-        'status': "hotspot",
-        'ssid': status['hotspot']['ssid'],
-        'password': status['hotspot']['password'],
-        'ip_address': status['hotspot']['ip_address']
-    }
-elif status['status'] == "disconnected":
-    display['status'] = "disconnected"
-else:
-    display['status'] = "unknown"
-
-hal.show_info(display)
 
 input_buffer = ""
+updated = True
 while True:
     if supervisor.runtime.serial_bytes_available:
             # Read available characters from standard input
@@ -53,16 +40,32 @@ while True:
             while "\n" in input_buffer:
                 line, input_buffer = input_buffer.split("\n", 1)
                 line = line.strip()  # Remove \r or trailing whitespace
-                
-                if line:
-                    # --- PROCESS YOUR DATA HERE ---
-                    print(f"Received Command: '{line}'")
-                    
-                    # Example action based on received string
-                    if line == "LED_ON":
-                        display['status'] = "disconnected"
-                        hal.show_info(display)
-                        pass
 
+                if line:
+                    separator = line.find(":")
+                    if separator == -1:
+                        continue
+                    cmd = line[:separator]
+                    payload = line[separator+1:]
+                    # Example action based on received string
+                    if cmd == "s":
+                        status['status'] = payload
+                        updated = True
+                    elif cmd == "i":
+                        status['ssid'] = payload
+                        updated = True
+                    elif cmd == "p":
+                        status['password'] = payload
+                        updated = True
+                    elif cmd == "a":
+                        status['ip_address'] = payload
+                        updated = True
+                    elif cmd == "m":
+                        status['message'] = payload
+                        updated = True
+
+    if updated:
+        hal.show_info(status)
+        updated = False
     # Small delay to keep the system responsive
     time.sleep(0.1)

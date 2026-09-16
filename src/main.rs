@@ -4,11 +4,12 @@
 
 mod adapters;
 mod blocking;
+mod companion;
 mod config;
 mod diagnostics;
 mod hotspot;
 mod monitor;
-mod status_dump;
+mod status;
 mod watchdog;
 mod wifi;
 

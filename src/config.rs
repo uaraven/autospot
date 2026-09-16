@@ -63,38 +63,16 @@ impl HotspotConfig {
     }
 }
 
-/// Where to write a live `status.json` for something else to read -- a microcontroller
-/// polling from an attached drive being the motivating case.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Whether to report Wi-Fi/hotspot status to a companion microcontroller over serial.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CompanionConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Volume label of the disk to write to, e.g. "CIRCUITPY". Resolved fresh (by
-    /// enumerating drives) every time a dump is written, so a drive that is unplugged
-    /// and replugged under a different letter is still found. Mutually exclusive with
-    /// `disk_path`.
     #[serde(default)]
-    pub disk_label: Option<String>,
-    /// A fixed root path to write to instead of searching by label, e.g. `"E:\\"`.
-    /// Mutually exclusive with `disk_label`.
+    pub vid: Option<u16>,
     #[serde(default)]
-    pub disk_path: Option<String>,
-    /// File name written at the root of the resolved disk. Must be a plain file name,
-    /// not a path.
-    #[serde(default = "default_companion_status_file_name")]
-    pub file_name: String,
-}
-
-impl Default for CompanionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            disk_label: None,
-            disk_path: None,
-            file_name: default_companion_status_file_name(),
-        }
-    }
+    pub pid: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -144,9 +122,6 @@ fn default_stdout_log_level() -> String {
 }
 fn default_log_path() -> PathBuf {
     PathBuf::from("autospot.log")
-}
-fn default_companion_status_file_name() -> String {
-    "status.json".to_string()
 }
 
 impl Default for MonitorConfig {
@@ -225,28 +200,6 @@ impl Config {
             );
         }
 
-        if self.companion.enabled {
-            let label = non_empty(self.companion.disk_label.as_deref());
-            let path = non_empty(self.companion.disk_path.as_deref());
-            match (label, path) {
-                (Some(_), Some(_)) => {
-                    bail!("status-dump: specify only one of disk_label or disk_path, not both")
-                }
-                (None, None) => {
-                    bail!("status-dump: enabled = true requires disk_label or disk_path")
-                }
-                _ => {}
-            }
-
-            let file_name = self.companion.file_name.trim();
-            if file_name.is_empty() {
-                bail!("status-dump.file_name must not be empty");
-            }
-            if file_name.contains(['/', '\\']) || file_name == "." || file_name == ".." {
-                bail!("status-dump.file_name must be a plain file name, not a path: '{file_name}'");
-            }
-        }
-
         Ok(())
     }
 
@@ -259,11 +212,6 @@ impl Config {
     pub fn disconnect_threshold(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.monitor.disconnect_threshold_secs)
     }
-}
-
-/// Trim and treat an empty string the same as absent.
-fn non_empty(s: Option<&str>) -> Option<&str> {
-    s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Map a config level string onto a `tracing` level. Returns `None` if unrecognised.
@@ -522,17 +470,14 @@ uplink_adapter = "   "
     }
 
     #[test]
-    fn status_dump_defaults_to_disabled() {
+    fn companion_defaults_to_disabled() {
         let cfg = Config::from_toml(FULL).unwrap();
         assert_eq!(cfg.companion, CompanionConfig::default());
         assert!(!cfg.companion.enabled);
-        assert_eq!(cfg.companion.file_name, "status.json");
-        assert_eq!(cfg.companion.disk_label, None);
-        assert_eq!(cfg.companion.disk_path, None);
     }
 
     #[test]
-    fn status_dump_parses_with_a_disk_label() {
+    fn companion_can_be_enabled() {
         let cfg = Config::from_toml(
             r#"
 [hotspot]
@@ -540,137 +485,12 @@ ssid = "Fallback"
 passphrase = "password1"
 uplink_adapter = "Ethernet"
 
-[status-dump]
+[companion]
 enabled = true
-disk_label = "CIRCUITPY"
-file_name = "status.json"
 "#,
         )
         .unwrap();
         assert!(cfg.companion.enabled);
-        assert_eq!(cfg.companion.disk_label.as_deref(), Some("CIRCUITPY"));
-        assert_eq!(cfg.companion.disk_path, None);
-        assert_eq!(cfg.companion.file_name, "status.json");
-    }
-
-    #[test]
-    fn status_dump_parses_with_a_disk_path() {
-        let cfg = Config::from_toml(
-            r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-enabled = true
-disk_path = "E:\\"
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.companion.disk_path.as_deref(), Some("E:\\"));
-        // file_name still defaults even though the section is present.
-        assert_eq!(cfg.companion.file_name, "status.json");
-    }
-
-    #[test]
-    fn status_dump_disabled_does_not_require_a_location() {
-        // enabled defaults to false, so an empty [status-dump] section is fine.
-        assert!(
-            Config::from_toml(
-                r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-"#,
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn status_dump_rejects_both_disk_label_and_disk_path() {
-        let err = Config::from_toml(
-            r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-enabled = true
-disk_label = "CIRCUITPY"
-disk_path = "E:\\"
-"#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("only one of"), "{err:#}");
-    }
-
-    #[test]
-    fn status_dump_enabled_requires_a_location() {
-        let err = Config::from_toml(
-            r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-enabled = true
-"#,
-        )
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("disk_label or disk_path"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn status_dump_rejects_an_empty_file_name() {
-        let err = Config::from_toml(
-            r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-enabled = true
-disk_label = "CIRCUITPY"
-file_name = "   "
-"#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("file_name"), "{err:#}");
-    }
-
-    #[test]
-    fn status_dump_rejects_a_file_name_that_is_a_path() {
-        for bad in ["sub/status.json", "sub\\status.json", ".."] {
-            let err = Config::from_toml(&format!(
-                r#"
-[hotspot]
-ssid = "Fallback"
-passphrase = "password1"
-uplink_adapter = "Ethernet"
-
-[status-dump]
-enabled = true
-disk_label = "CIRCUITPY"
-file_name = '{bad}'
-"#
-            ))
-            .unwrap_err();
-            assert!(
-                format!("{err:#}").contains("plain file name"),
-                "file_name = {bad}: {err:#}"
-            );
-        }
     }
 
     #[test]
