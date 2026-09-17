@@ -1,9 +1,7 @@
 import displayio
 import board
-import busio
-import fourwire
-import adafruit_st7789
 import terminalio
+import supervisor
 from adafruit_display_text import label
 
 
@@ -12,6 +10,7 @@ _main_group = None
 _display = None
 
 RED = 0xFF0000
+
 wifi_bitmap = displayio.OnDiskBitmap("/images/wifi.bmp")
 addr_bitmap = displayio.OnDiskBitmap("/images/address.bmp")
 disc_bitmap = displayio.OnDiskBitmap("/images/disconnected.bmp")
@@ -66,23 +65,9 @@ def show_info(items):
 
 
 def initialize_display():
-
-    displayio.release_displays()
-
-    tft_clk = board.LCD_CLK
-    tft_mosi = board.LCD_MOSI
-    tft_cs = board.LCD_CS
-    tft_dc = board.LCD_DC
-    tft_rst = board.LCD_RESET
-    tft_bl = board.LCD_BACKLIGHT
-
-    tft_spi = busio.SPI(clock=tft_clk, MOSI=tft_mosi)
-    display_bus = fourwire.FourWire(tft_spi, command=tft_dc, chip_select=tft_cs, reset=tft_rst)
     global _display, _main_group
-    _display = adafruit_st7789.ST7789(display_bus,
-                                    width=135, height=240,
-                                    rowstart=40, colstart=53,
-                                    backlight_pin=tft_bl)
+    _display = supervisor.runtime.display
+
     _display.rotation=270
     _display.auto_refresh = False
 
