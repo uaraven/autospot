@@ -30,9 +30,6 @@ Run autospot - the status of the connection should be displayed on the controlle
 
 If autospot's logs shows "no companion device found", you might need to change the configuration of the USB device, refer to [companion installation guide](install.txt) for more details.
 
-## Limitations
-
-When the companion starts, it looks for the status.json file on its storage. If the file is present, it will display the status stored in this file. If the autospot program is not running on the connected computer, the companion will display a stale value left over from previous runs - the storage is read-only for the microcontroller, so it cannot change it.
 
 ## Supported boards
 
