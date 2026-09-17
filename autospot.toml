@@ -45,8 +45,8 @@ enabled = true
 # to match the VID&PID of your microcontroller board (you can find this in Device manager)
 # You can also uncommed custom VID&PID setting in boot.py in the controller firmware
 # and make sure that VID&PID in boot.py and here match
-vid=0x1209
-pid=0x3a01
+#vid=0x1209
+#pid=0x3a01
 
 [logging]
 # error | warn | info | debug | trace

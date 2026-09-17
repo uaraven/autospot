@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::{self, Adapter};
@@ -106,7 +106,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
                     down_for_secs = down_for.as_secs(),
                     "Wi-Fi has been down past the threshold; bringing the hotspot up"
                 );
-                if let Err(e) = try_start(cfg, &mut watchdog) {
+                if let Err(e) = try_start(cfg, &mut watchdog, &status) {
                     error!("could not start the hotspot: {e:#}");
                     watchdog.record_start_failure(now);
                 }
@@ -152,15 +152,18 @@ fn update_companion_status(
     last_state_change: &mut Instant,
     log_missing_companion: &mut bool,
 ) {
+    let radio_enabled = status.radio_enabled();
     let wifi_snapshot = match status.active_interface(ignore_ssid) {
         Some(iface) => status::WifiSnapshot {
             wifi_ok,
+            radio_enabled,
             connected: true,
             ssid: iface.ssid.as_deref(),
             ip_address: adapters::ipv4_of(adapters, &iface.description),
         },
         None => status::WifiSnapshot {
             wifi_ok,
+            radio_enabled,
             connected: false,
             ssid: None,
             ip_address: None,
@@ -295,7 +298,13 @@ fn hotspot_summary_text(live: &Option<LiveHotspot>, adapters: &[Adapter]) -> Str
 }
 
 /// Bring the hotspot up, unless it is already up or mid-transition.
-fn try_start(cfg: &Config, watchdog: &mut Watchdog) -> Result<()> {
+fn try_start(cfg: &Config, watchdog: &mut Watchdog, wifi_status: &wifi::WifiStatus) -> Result<()> {
+    if !wifi_status.radio_enabled() {
+        bail!(
+            "Wi-Fi is turned off; not starting the hotspot (Mobile Hotspot needs the Wi-Fi radio on to broadcast)"
+        );
+    }
+
     let hotspot = Hotspot::for_uplink(&cfg.hotspot.uplink_adapter)?;
 
     match hotspot.state()? {
@@ -362,6 +371,7 @@ mod tests {
                 description: description.into(),
                 connected: true,
                 ssid: Some(ssid.into()),
+                radio_enabled: true,
             }],
         }
     }

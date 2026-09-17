@@ -22,6 +22,7 @@ The input `info` dictionary will have at least one element: `status`. `info['sta
  - "connected" - the main computer is connected to a network
  - "hotspot" - the main computer is in hotspot mode
  - "disconnected" - the main computer is not connected to any network, but the hotspot is not yet active
+ - "wifi-off" - the Wi-Fi has been turned off
  - anything else is treated as "unknown state"
 
 Depending on the status, the `info` dict will contain additional keys.

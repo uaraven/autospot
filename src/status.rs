@@ -3,6 +3,9 @@ use std::collections::HashMap;
 /// The Wi-Fi half of what `compute()` needs, already resolved by the caller.
 pub struct WifiSnapshot<'a> {
     pub wifi_ok: bool,
+    /// False when the adapter's radio itself is off (the Wi-Fi toggle), as opposed to
+    /// merely being disconnected from a network.
+    pub radio_enabled: bool,
     pub connected: bool,
     pub ssid: Option<&'a str>,
     pub ip_address: Option<&'a str>,
@@ -36,6 +39,8 @@ impl Status {
         let mut elements: HashMap<&'static str, String> = HashMap::new();
         if !wifi.wifi_ok {
             elements.insert("s", "unknown".to_string());
+        } else if !wifi.radio_enabled {
+            elements.insert("s", "wifi-off".to_string());
         } else if wifi.connected {
             elements.insert("s", "connected".to_string());
             elements.insert("i", wifi.ssid.unwrap_or("N/A").to_string());
@@ -97,6 +102,7 @@ mod tests {
     fn wifi_connected<'a>(ssid: Option<&'a str>, ip: Option<&'a str>) -> WifiSnapshot<'a> {
         WifiSnapshot {
             wifi_ok: true,
+            radio_enabled: true,
             connected: true,
             ssid,
             ip_address: ip,
@@ -106,6 +112,17 @@ mod tests {
     fn wifi_disconnected() -> WifiSnapshot<'static> {
         WifiSnapshot {
             wifi_ok: true,
+            radio_enabled: true,
+            connected: false,
+            ssid: None,
+            ip_address: None,
+        }
+    }
+
+    fn wifi_radio_off() -> WifiSnapshot<'static> {
+        WifiSnapshot {
+            wifi_ok: true,
+            radio_enabled: false,
             connected: false,
             ssid: None,
             ip_address: None,
@@ -176,6 +193,15 @@ mod tests {
     fn disconnected_when_wifi_and_hotspot_are_both_down() {
         let status = Status::new(&wifi_disconnected(), None);
         assert_eq!(elements_of(&status), vec!["s:disconnected".to_string()]);
+    }
+
+    #[test]
+    fn wifi_off_reports_even_with_a_hotspot_argument() {
+        let status = Status::new(
+            &wifi_radio_off(),
+            Some(&hotspot_on("AP", "pw", Some("192.168.137.1"))),
+        );
+        assert_eq!(elements_of(&status), vec!["s:wifi-off".to_string()]);
     }
 
     #[test]
