@@ -4,9 +4,10 @@ use anyhow::{bail, Result};
 use windows::core::GUID;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WiFi::{
-    wlan_intf_opcode_current_connection, wlan_interface_state_connected, WlanCloseHandle,
-    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST,
+    dot11_radio_state_on, wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state,
+    wlan_interface_state_connected, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
+    WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO,
+    WLAN_INTERFACE_INFO_LIST, WLAN_RADIO_STATE,
 };
 
 /// What a single Wi-Fi adapter is currently doing.
@@ -16,6 +17,10 @@ pub struct InterfaceStatus {
     pub connected: bool,
     /// SSID of the current connection, when connected and readable.
     pub ssid: Option<String>,
+    /// True unless the adapter's software radio is known to be off (the Wi-Fi toggle in
+    /// Windows Settings / Action Center). Defaults to `true` when the state can't be
+    /// read, so a query failure never falsely blocks a legitimate hotspot start.
+    pub radio_enabled: bool,
 }
 
 /// Snapshot of every Wi-Fi adapter on the machine.
@@ -50,6 +55,13 @@ impl WifiStatus {
     pub fn connected_ssid(&self, ignore_ssid: Option<&str>) -> Option<&str> {
         self.active_interface(ignore_ssid)
             .and_then(|i| i.ssid.as_deref())
+    }
+
+    /// True when Wi-Fi can plausibly be used at all -- i.e. at least one adapter's radio
+    /// is on. An empty interface list (nothing to read) counts as "unknown", not
+    /// "disabled", for the same fail-open reason as `InterfaceStatus::radio_enabled`.
+    pub fn radio_enabled(&self) -> bool {
+        self.interfaces.is_empty() || self.interfaces.iter().any(|i| i.radio_enabled)
     }
 }
 
@@ -117,6 +129,8 @@ fn read_interface(handle: HANDLE, info: &WLAN_INTERFACE_INFO) -> InterfaceStatus
         } else {
             None
         },
+        // Radio state is independent of association, so this is read unconditionally.
+        radio_enabled: radio_enabled(handle, &info.InterfaceGuid),
     }
 }
 
@@ -158,6 +172,44 @@ fn current_ssid(handle: HANDLE, guid: &GUID) -> Option<String> {
     }
 }
 
+/// Query `wlan_intf_opcode_radio_state` for whether the adapter's software radio is on.
+///
+/// Best effort: like `current_ssid`, a query failure only costs a less precise status --
+/// but unlike `current_ssid` this feeds a real decision (whether to attempt a hotspot
+/// start), so failures default to `true` rather than `false` to avoid ever blocking a
+/// legitimate start on a read we couldn't perform.
+fn radio_enabled(handle: HANDLE, guid: &GUID) -> bool {
+    let mut size = 0u32;
+    let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    let rc = unsafe {
+        WlanQueryInterface(
+            handle,
+            guid,
+            wlan_intf_opcode_radio_state,
+            None,
+            &mut size,
+            &mut data,
+            None,
+        )
+    };
+    if rc != ERROR_SUCCESS.0 || data.is_null() {
+        return true;
+    }
+
+    // SAFETY: on success the call yields a fixed-size WLAN_RADIO_STATE buffer that we
+    // own and must release with WlanFreeMemory.
+    unsafe {
+        let state = &*(data as *const WLAN_RADIO_STATE);
+        let count = (state.dwNumberOfPhys as usize).min(state.PhyRadioState.len());
+        let enabled = state.PhyRadioState[..count]
+            .iter()
+            .any(|phy| phy.dot11SoftwareRadioState == dot11_radio_state_on);
+        WlanFreeMemory(data as *const _);
+        enabled
+    }
+}
+
 /// Convert a fixed-size, NUL-padded UTF-16 buffer into a `String`.
 fn wide_to_string(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -173,6 +225,7 @@ mod tests {
             description: "test".into(),
             connected,
             ssid: ssid.map(str::to_string),
+            radio_enabled: true,
         }
     }
 
@@ -215,6 +268,33 @@ mod tests {
             interfaces: vec![iface(true, None)],
         };
         assert!(status.is_connected(Some("MyFallbackHotspot")));
+    }
+
+    #[test]
+    fn no_interfaces_counts_as_radio_state_unknown_not_disabled() {
+        assert!(WifiStatus::default().radio_enabled());
+    }
+
+    #[test]
+    fn any_interface_with_radio_on_counts() {
+        let mut off = iface(false, None);
+        off.radio_enabled = false;
+        let status = WifiStatus {
+            interfaces: vec![off, iface(true, Some("home"))],
+        };
+        assert!(status.radio_enabled());
+    }
+
+    #[test]
+    fn all_radios_off_means_wifi_is_disabled() {
+        let mut a = iface(false, None);
+        a.radio_enabled = false;
+        let mut b = iface(false, None);
+        b.radio_enabled = false;
+        let status = WifiStatus {
+            interfaces: vec![a, b],
+        };
+        assert!(!status.radio_enabled());
     }
 
     #[test]

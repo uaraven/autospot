@@ -8,7 +8,7 @@ use windows::core::GUID;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+    IF_TYPE_ETHERNET_CSMACD, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
 };
 use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS, AF_INET, AF_UNSPEC};
 
@@ -21,6 +21,10 @@ pub struct Adapter {
     pub friendly_name: String,
     /// Hardware description, e.g. "Realtek PCIe GbE Family Controller".
     pub description: String,
+    /// Is this a wired Ethernet adapter (as opposed to Wi-Fi or any other interface
+    /// type)? Used to prefer wired links when picking a hotspot uplink among otherwise
+    /// equally-good candidates.
+    pub is_ethernet: bool,
     /// IPv4 addresses currently assigned to this adapter, in dotted-decimal form.
     pub ipv4: Vec<String>,
 }
@@ -109,6 +113,7 @@ unsafe fn collect(mut current: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
             guid: unsafe { guid_from_adapter_name(entry) },
             friendly_name: unsafe { pwstr_to_string(entry.FriendlyName.0) },
             description: unsafe { pwstr_to_string(entry.Description.0) },
+            is_ethernet: entry.IfType == IF_TYPE_ETHERNET_CSMACD,
             ipv4: unsafe { ipv4_addresses(entry) },
         });
         current = entry.Next;
@@ -207,6 +212,7 @@ mod tests {
             guid: GUID::zeroed(),
             friendly_name: friendly.into(),
             description: description.into(),
+            is_ethernet: false,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }

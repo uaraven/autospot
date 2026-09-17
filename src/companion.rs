@@ -1,10 +1,12 @@
 use serialport::*;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::{config::CompanionConfig, status::Status};
 
 const VENDOR: &str = "autoport";
 const PRODUCT: &str = "companion";
+const DEFAULT_VID: u16 = 0x1209;
+const DEFAULT_PID: u16 = 0x3a01;
 
 pub struct CompanionConn {
     port: SerialPortInfo,
@@ -23,7 +25,7 @@ impl CompanionConn {
             }
         };
         for port in ports {
-            debug!("checking port {:?}", port);
+            trace!("checking port {:?}", port);
             if let SerialPortType::UsbPort(UsbPortInfo {
                 vid,
                 pid,
@@ -37,6 +39,8 @@ impl CompanionConn {
                     && *vid == c_vid
                     && *pid == c_pid
                 {
+                    true
+                } else if *vid == DEFAULT_VID && *pid == DEFAULT_PID {
                     true
                 } else if manufacturer.as_deref() == Some(VENDOR)
                     && product.as_deref() == Some(PRODUCT)

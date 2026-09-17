@@ -1,5 +1,4 @@
 import displayio
-import board
 import terminalio
 import supervisor
 from adafruit_display_text import label
@@ -58,6 +57,8 @@ def show_info(items):
             _ico_line(clock_bitmap, items['time'] + "s", 70)
         else:
             _ico_line(disc_bitmap, 'Disconnected', 50)
+    elif items['status'] == "wifi-off":
+        _ico_line(disc_bitmap, "Wi-Fi: OFF", 50)
     else:
         _ico_line(nodata_bitmap, 'No data', 40)
         _add_line("Run autospot.exe", 75)
