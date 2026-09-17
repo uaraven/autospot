@@ -56,7 +56,7 @@ If you want to add support for a new microcontroller board follow these steps:
   - show_info(items: dict) - to display the information
 - create pull request
 
-See [this file](hal/readme.md) for more details on HAL implementation.
+See [this file](board/readme.md) for more details on HAL implementation.
 
 ## License
 
