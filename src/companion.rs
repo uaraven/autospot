@@ -1,5 +1,5 @@
 use serialport::*;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::{config::CompanionConfig, status::Status};
 
@@ -23,7 +23,7 @@ impl CompanionConn {
             }
         };
         for port in ports {
-            debug!("checking port {:?}", port);
+            trace!("checking port {:?}", port);
             if let SerialPortType::UsbPort(UsbPortInfo {
                 vid,
                 pid,

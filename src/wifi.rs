@@ -1,5 +1,6 @@
 //! Wi-Fi connection status via the Win32 native Wi-Fi API (`wlanapi.dll`).
 
+use tracing::debug;
 use anyhow::{bail, Result};
 use windows::core::GUID;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
@@ -108,6 +109,7 @@ pub fn query() -> Result<WifiStatus> {
 
 fn read_interface(handle: HANDLE, info: &WLAN_INTERFACE_INFO) -> InterfaceStatus {
     let connected = info.isState == wlan_interface_state_connected;
+    debug!("Interface status {:?}", info.isState);
     InterfaceStatus {
         description: wide_to_string(&info.strInterfaceDescription),
         connected,

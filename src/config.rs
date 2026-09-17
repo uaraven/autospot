@@ -48,7 +48,8 @@ pub struct HotspotConfig {
     /// friendly name ("Ethernet"), its hardware description, or the network profile
     /// name, case-insensitively. The literal value `"auto"` instead picks, on every
     /// lookup, whichever currently-connected network ranks best (internet access beats
-    /// local-only), skipping the hotspot's own virtual adapter.
+    /// local-only; a tie is then broken in favor of a wired Ethernet adapter over
+    /// Wi-Fi), skipping the hotspot's own virtual adapter.
     pub uplink_adapter: String,
 }
 

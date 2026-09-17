@@ -213,7 +213,9 @@ impl Hotspot {
 /// One adapter can carry several profiles -- remembered networks it is not currently
 /// using still show up. Sharing one of those would fail with
 /// `NetworkLimitedConnectivity`, so among the matches the one with the best connectivity
-/// wins.
+/// wins; a tie is broken in favor of a wired Ethernet adapter over Wi-Fi (or any other
+/// interface type). This applies whenever more than one profile matches, whether that's
+/// because of auto-selection or because a named adapter has several stored profiles.
 pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, String)> {
     let auto = adapter_name.trim().eq_ignore_ascii_case(crate::config::AUTO_UPLINK);
 
@@ -231,7 +233,7 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
     };
 
     let mut seen: Vec<String> = Vec::new();
-    let mut best: Option<(u8, ConnectionProfile, String)> = None;
+    let mut best: Option<((u8, bool), ConnectionProfile, String)> = None;
 
     for profile in &profiles {
         let profile_name = profile
@@ -247,6 +249,7 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
         let matched_adapter = adapter_guid.and_then(|guid| adapters.iter().find(|a| a.guid == guid));
 
         let adapter_label = matched_adapter.map(|a| a.friendly_name.clone());
+        let is_ethernet = matched_adapter.is_some_and(|a| a.is_ethernet);
 
         let level = profile.GetNetworkConnectivityLevel().ok();
 
@@ -271,22 +274,22 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
             continue;
         }
 
-        let rank = rank_connectivity(level);
-        if best.as_ref().is_none_or(|(best_rank, _, _)| rank > *best_rank) {
+        let score = uplink_score(level, is_ethernet);
+        if best.as_ref().is_none_or(|(best_score, _, _)| score > *best_score) {
             let label = adapter_label.unwrap_or_else(|| profile_name.clone());
-            best = Some((rank, profile, label));
+            best = Some((score, profile, label));
         }
     }
 
-    if let Some((rank, profile, label)) = best {
-        if rank < RANK_INTERNET {
+    if let Some((score, profile, label)) = best {
+        if score.0 < RANK_INTERNET {
             // This function is now polled every tick for the console status line, so this
             // stays at debug: a real failure to start surfaces loudly from start() itself
             // (TetheringOperationStatus::NetworkLimitedConnectivity), which is the moment
             // that actually deserves the user's attention.
             debug!(
                 uplink = %label,
-                "the uplink network has no internet access; the hotspot may refuse to start"
+                "The uplink network has no internet access; the hotspot may refuse to start"
             );
         }
         return Ok((profile, label));
@@ -326,6 +329,14 @@ fn rank_connectivity(level: Option<NetworkConnectivityLevel>) -> u8 {
         Some(NetworkConnectivityLevel::LocalAccess) => 1,
         _ => 0,
     }
+}
+
+/// Break a connectivity-rank tie in favour of Ethernet -- a wired link is the more
+/// predictable choice to share when two candidates are otherwise equally good. Tuple
+/// comparison is lexicographic and `false < true`, so connectivity rank always dominates
+/// and Ethernet only decides a tie.
+fn uplink_score(level: Option<NetworkConnectivityLevel>, is_ethernet: bool) -> (u8, bool) {
+    (rank_connectivity(level), is_ethernet)
 }
 
 fn describe_connectivity(level: Option<NetworkConnectivityLevel>) -> &'static str {
@@ -431,6 +442,22 @@ mod tests {
         assert_eq!(
             rank_connectivity(Some(NetworkConnectivityLevel::InternetAccess)),
             RANK_INTERNET
+        );
+    }
+
+    #[test]
+    fn ethernet_breaks_a_tie_in_connectivity_rank() {
+        assert!(
+            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), true)
+                > uplink_score(Some(NetworkConnectivityLevel::InternetAccess), false)
+        );
+    }
+
+    #[test]
+    fn connectivity_rank_still_dominates_over_ethernet() {
+        assert!(
+            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), false)
+                > uplink_score(Some(NetworkConnectivityLevel::LocalAccess), true)
         );
     }
 

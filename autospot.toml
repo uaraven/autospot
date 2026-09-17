@@ -32,14 +32,13 @@ band = "Auto"
 # plugged in and up for the hotspot to have anything to share.
 # `autospot.exe status` lists the exact names available on this machine.
 # Use "auto" instead of a name to let Autospot pick whichever connected network currently
-# has the best connectivity (it re-checks every time, and never picks the hotspot's own
-# virtual adapter).
+# has the best connectivity.
 uplink_adapter = "auto"
 
 [companion]
-# Enables sending Wi-Fi/hotspot status to a companion microcontroller over serial.
-# The device is found automatically by its USB manufacturer/product strings; no port
-# needs to be configured, and it is safe to leave this on even when nothing is plugged in.
+# Enables sending Wi-Fi/hotspot status to a companion microcontroller over the serial port.
+# The device is found automatically by its USB manufacturer/product strings, and it is safe
+# to leave this on even when nothing is plugged in.
 enabled = true
 
 # If the device is not detected automatically, configure the USB vendor ID and Product ID

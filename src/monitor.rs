@@ -351,6 +351,7 @@ mod tests {
             guid: windows::core::GUID::zeroed(),
             friendly_name: friendly.into(),
             description: description.into(),
+            is_ethernet: false,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }
