@@ -87,8 +87,15 @@ pub struct LoggingConfig {
     /// the app runs in the foreground.
     #[serde(default = "default_stdout_log_level")]
     pub stdout_level: String,
-    /// Log file path. A relative path is resolved against the executable's directory
-    /// so the task scheduler's working directory does not matter.
+    /// Level for the rotated log file when running as the Windows service. There is no
+    /// console in that mode, so the file is the only place output is read -- defaults
+    /// to `info`, matching what `stdout_level` would otherwise have shown live.
+    #[serde(default = "default_service_log_level")]
+    pub service_level: String,
+    /// Log file path. A relative path is resolved against
+    /// `%USERPROFILE%\Documents\autospot\logs` in console/application mode, or
+    /// `%ProgramData%\autospot\logs` when running as the service -- see
+    /// `user_documents_log_dir` and `service::program_data_log_dir` in the source.
     #[serde(default = "default_log_path")]
     pub path: PathBuf,
 }
@@ -121,6 +128,9 @@ fn default_file_log_level() -> String {
 fn default_stdout_log_level() -> String {
     "info".to_string()
 }
+fn default_service_log_level() -> String {
+    "info".to_string()
+}
 fn default_log_path() -> PathBuf {
     PathBuf::from("autospot.log")
 }
@@ -140,6 +150,7 @@ impl Default for LoggingConfig {
         Self {
             file_level: default_file_log_level(),
             stdout_level: default_stdout_log_level(),
+            service_level: default_service_log_level(),
             path: default_log_path(),
         }
     }
@@ -200,6 +211,12 @@ impl Config {
                 self.logging.stdout_level
             );
         }
+        if parse_level(&self.logging.service_level).is_none() {
+            bail!(
+                "logging.service_level must be one of error|warn|info|debug|trace, got '{}'",
+                self.logging.service_level
+            );
+        }
 
         Ok(())
     }
@@ -246,6 +263,7 @@ uplink_adapter = "Ethernet"
 [logging]
 file_level = "warn"
 stdout_level = "debug"
+service_level = "trace"
 path = "autospot.log"
 "#;
 
@@ -261,6 +279,7 @@ path = "autospot.log"
         assert_eq!(cfg.hotspot.uplink_adapter, "Ethernet");
         assert_eq!(cfg.logging.file_level, "warn");
         assert_eq!(cfg.logging.stdout_level, "debug");
+        assert_eq!(cfg.logging.service_level, "trace");
         assert_eq!(cfg.logging.path, PathBuf::from("autospot.log"));
     }
 
@@ -415,7 +434,27 @@ stdout_level = "verbose"
     }
 
     #[test]
-    fn logging_levels_default_to_error_for_file_and_info_for_stdout() {
+    fn rejects_unknown_service_log_level() {
+        let err = Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+
+[logging]
+service_level = "verbose"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("logging.service_level"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn logging_levels_default_to_error_for_file_and_info_for_stdout_and_service() {
         let cfg = Config::from_toml(
             r#"
 [hotspot]
@@ -427,6 +466,7 @@ uplink_adapter = "Ethernet"
         .unwrap();
         assert_eq!(cfg.logging.file_level, "error");
         assert_eq!(cfg.logging.stdout_level, "info");
+        assert_eq!(cfg.logging.service_level, "info");
     }
 
     #[test]

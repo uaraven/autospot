@@ -2,7 +2,8 @@
 //! response, and prints the console status line and optional companion status update.
 
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use tracing::{debug, error, info, warn};
@@ -43,7 +44,7 @@ impl<'a> Monitor<'a> {
         }
     }
 
-    fn run(&mut self, config_path: &Path) -> Result<()> {
+    fn run(&mut self, config_path: &Path, stop: &AtomicBool) -> Result<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             config = %config_path.display(),
@@ -55,7 +56,7 @@ impl<'a> Monitor<'a> {
             "autospot starting"
         );
 
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             let now = Instant::now();
 
             let (wifi_ok, status) = match wifi::query() {
@@ -79,7 +80,7 @@ impl<'a> Monitor<'a> {
             }
 
             if !wifi_ok {
-                std::thread::sleep(self.cfg.poll_interval());
+                sleep_or_stop(self.cfg.poll_interval(), stop);
                 continue;
             }
 
@@ -99,8 +100,11 @@ impl<'a> Monitor<'a> {
 
             self.handle_intent(now, &status, intent);
 
-            std::thread::sleep(self.cfg.poll_interval());
+            sleep_or_stop(self.cfg.poll_interval(), stop);
         }
+
+        info!("autospot stopping");
+        Ok(())
     }
 
     /// React to what the watchdog decided this tick: log it, and bring the hotspot up
@@ -260,9 +264,27 @@ impl<'a> Monitor<'a> {
     }
 }
 
-/// The watchdog loop.
-pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
-    Monitor::new(cfg).run(config_path)
+/// The watchdog loop. Runs until `stop` is set to `true` (checked once per poll tick,
+/// with sub-second latency once set); pass a flag that's never written to run forever,
+/// as the console `run` command does.
+pub fn run(cfg: &Config, config_path: &Path, stop: &AtomicBool) -> Result<()> {
+    Monitor::new(cfg).run(config_path, stop)
+}
+
+/// Sleep for `duration`, but wake early -- within ~500ms -- if `stop` is set, so a
+/// service stop request doesn't have to wait out a full poll interval, which can be
+/// tens of seconds.
+fn sleep_or_stop(duration: Duration, stop: &AtomicBool) {
+    let step = Duration::from_millis(500);
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let this_step = step.min(remaining);
+        std::thread::sleep(this_step);
+        remaining -= this_step;
+    }
 }
 
 /// One readable line summarising what is true right now: Wi-Fi state and IP, hotspot
@@ -367,6 +389,26 @@ fn query_hotspot(cfg: &Config) -> Option<LiveHotspot> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn test_config() -> Config {
+        Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_returns_immediately_when_already_told_to_stop() {
+        let cfg = test_config();
+        let stop = AtomicBool::new(true);
+        let path = Path::new("autospot.toml");
+        assert!(run(&cfg, path, &stop).is_ok());
+    }
 
     fn adapter(friendly: &str, description: &str, ipv4: &[&str]) -> Adapter {
         Adapter {

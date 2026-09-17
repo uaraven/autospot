@@ -18,6 +18,28 @@ To enable automatic start with windows:
  - Move the shortcut for autospot.exe into the Startup folder.
  - autospot.exe will start the next time you restart windows.
 
+This starts autospot in your own login session, so it only runs once you've logged in.
+If you need the hotspot available before login (e.g. on a headless machine), install
+autospot as a Windows service instead -- see below.
+
+## Running as a Windows service
+
+Autospot can run as a Windows service instead of a console app, so it starts before any
+user logs in. From an elevated ("Run as administrator") command prompt or PowerShell:
+
+```
+autospot.exe service install   # registers and starts the service
+autospot.exe service status    # shows whether it's installed and its current state
+autospot.exe service remove    # stops and unregisters the service
+```
+
+The service logs to `%ProgramData%\autospot\logs\autospot.log`, at the level set by
+`logging.service_level` in `autospot.toml` (defaults to `info`, since there's no console
+in service mode for routine status lines to go to instead). While the service is
+running, plain `autospot.exe` (with no service commands) will print a warning and exit
+instead of starting a second watchdog -- stop or remove the service first if you want to
+run it as a console app again.
+
 ## Configuration
 
 There is an `autospot.toml` configuration file distributed alongside the `autospot.exe`. Edit it with notepad to update the settings as you need. You can change the check interval, the disconnection wait time, name and password for the hotspot, etc. All the configuration options in `autospot.toml` are commented with explanations.
