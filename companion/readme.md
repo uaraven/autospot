@@ -10,15 +10,22 @@ This repository contains the source code for the Autospot companion. This code r
 
 ## Requirements
 
-A microcontroller that is compatible with CircuitPython 10, has a display, and presents itself as a USB mass-storage device. Examples include LilyGo T-Display RP2040, LilyGo T-Dongle S3, etc.
+A microcontroller that is compatible with CircuitPython 10, and has a display. Devices that present an USB mass storage drive are recommended because of the ease of installation.
 
-### Why USB mass-storage?
+There is no real requirement to have all-in-one pre-packaged board with display. Adding display (such as [Pimoroni Pico Display](https://shop.pimoroni.com/products/pico-display-pack?variant=32368664215635)) to Raspberry Pi Pico will work just fine.
 
-The companion code is as simple as it gets - it reads the file from the storage and displays its contents. Autospot does not support Serial-over-USB communications, it only writes JSON to the specified drive.
+Examples include LilyGo T-Display RP2040, LilyGo T-Dongle S3, etc.
 
-CircuitPython automatically presents the microcontroller's flash memory as a USB drive for the _compatible_ devices. Usually, "compatible" means a device that can manage USB connection on its own. A lot of popular ESP-based microcontrollers are not supported, as they require a separate chip for USB connection.
+### Operation
 
-See [below](#supported-boards) for the list of tested boards.
+autospot.exe running on the host computer automatically detects the companion device and sends a status update every time when ther e is a change in the network configuration.
+
+Companion device shows the status received from the autospot, including active Wi-Fi connection with the host IP address, name of the hotspot, password and host IP address in the Hotspot mode and others.
+
+There is no way to test all the available devices for compatibility, but most of the RP2040, RP2350 and ESP32-S3 based devices should work. 
+
+Boards that are not listed in the [list below](#supported-boards) can work, but might require some programming to properly support
+display. Display bus, initialization, resolution might require writing a new hardware abstraction layer for the board. See [board docs](board/readme.md) for details.
 
 ## Installation
 

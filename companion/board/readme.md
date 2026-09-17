@@ -8,11 +8,9 @@ Behind this fancy name is a simple Python module with two functions:
 
 ## initialize_display
 
-Autospot companion uses Adafruit's [displayio](https://docs.circuitpython.org/en/latest/shared-bindings/displayio/) library for the display output.
-
-For more information on `displayio` and how to use it refer to this [tutorial](https://learn.adafruit.com/circuitpython-display-support-using-displayio/introduction).
-
 The `initialize_display()` function should perform all the necessary setup to configure the display: setup pins, configure the corresponding bus (SPI, I2C, etc).
+
+Recommended way is to use Adafruit's [displayio](https://docs.circuitpython.org/en/latest/shared-bindings/displayio/) library for the display output, but it is not required and any other approach will work.
 
 ## show_info
 
@@ -43,6 +41,10 @@ Available keys:
 ### Disconnected status
 
  - "time" - the time in seconds since disconnect. This key is optional, the code must handle the absense of this key.
+
+### Wifi Off status
+
+No additional keys are available for this status.
 
 ### Unknown status
 
