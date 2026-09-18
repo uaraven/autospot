@@ -7,8 +7,12 @@ use anyhow::{bail, Result};
 use windows::core::GUID;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    IF_TYPE_ETHERNET_CSMACD, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+    GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2,
+};
+use windows::Win32::NetworkManagement::Ndis::{
+    NdisPhysicalMedium802_3, NdisPhysicalMediumNative802_11, NdisPhysicalMediumWirelessLan,
+    NET_LUID_LH, NDIS_PHYSICAL_MEDIUM,
 };
 use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS, AF_INET, AF_UNSPEC};
 
@@ -23,8 +27,14 @@ pub struct Adapter {
     pub description: String,
     /// Is this a wired Ethernet adapter (as opposed to Wi-Fi or any other interface
     /// type)? Used to prefer wired links when picking a hotspot uplink among otherwise
-    /// equally-good candidates.
+    /// equally-good candidates. Based on the adapter's NDIS physical medium, not its
+    /// `IfType` -- several emulated-Ethernet transports (Bluetooth PAN in particular,
+    /// via BNEP) report `IfType`s identical to a real NIC's, so `IfType` alone can't
+    /// tell them apart.
     pub is_ethernet: bool,
+    /// Is this a Wi-Fi adapter? Used to recognise the adapter the hotspot itself will
+    /// broadcast on, so it's never picked as its own uplink.
+    pub is_wifi: bool,
     /// IPv4 addresses currently assigned to this adapter, in dotted-decimal form.
     pub ipv4: Vec<String>,
 }
@@ -109,16 +119,38 @@ unsafe fn collect(mut current: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
     let mut adapters = Vec::new();
     while !current.is_null() {
         let entry = unsafe { &*current };
+        let medium = unsafe { physical_medium(entry.Luid) };
         adapters.push(Adapter {
             guid: unsafe { guid_from_adapter_name(entry) },
             friendly_name: unsafe { pwstr_to_string(entry.FriendlyName.0) },
             description: unsafe { pwstr_to_string(entry.Description.0) },
-            is_ethernet: entry.IfType == IF_TYPE_ETHERNET_CSMACD,
+            is_ethernet: medium == Some(NdisPhysicalMedium802_3),
+            is_wifi: medium == Some(NdisPhysicalMediumNative802_11)
+                || medium == Some(NdisPhysicalMediumWirelessLan),
             ipv4: unsafe { ipv4_addresses(entry) },
         });
         current = entry.Next;
     }
     adapters
+}
+
+/// Query the NDIS physical medium of the adapter identified by `luid` -- a much more
+/// reliable "what kind of link is this, really" signal than `IfType`. `None` on any
+/// failure (e.g. the interface disappeared between enumeration and this call); callers
+/// treat that the same as "unknown", not as a match for anything.
+unsafe fn physical_medium(luid: NET_LUID_LH) -> Option<NDIS_PHYSICAL_MEDIUM> {
+    let mut row = MIB_IF_ROW2 {
+        InterfaceLuid: luid,
+        ..Default::default()
+    };
+    // SAFETY: `row` is a valid, fully zeroed `MIB_IF_ROW2` with only the lookup key set,
+    // exactly what `GetIfEntry2` expects to fill in.
+    let rc = unsafe { GetIfEntry2(&mut row) };
+    if rc == ERROR_SUCCESS {
+        Some(row.PhysicalMediumType)
+    } else {
+        None
+    }
 }
 
 /// Walk `FirstUnicastAddress` and collect every IPv4 address assigned to this adapter.
@@ -213,6 +245,7 @@ mod tests {
             friendly_name: friendly.into(),
             description: description.into(),
             is_ethernet: false,
+            is_wifi: false,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }

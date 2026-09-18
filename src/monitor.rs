@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::{self, Adapter};
@@ -76,7 +76,13 @@ impl<'a> Monitor<'a> {
             let live_hotspot = query_hotspot(self.cfg);
 
             if self.cfg.companion.enabled {
-                self.update_companion_status(now, wifi_ok, &status, &adapters_snapshot, &live_hotspot);
+                self.update_companion_status(
+                    now,
+                    wifi_ok,
+                    &status,
+                    &adapters_snapshot,
+                    &live_hotspot,
+                );
             }
 
             if !wifi_ok {
@@ -155,15 +161,24 @@ impl<'a> Monitor<'a> {
             );
         }
 
-        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot.uplink_adapter)?;
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
 
         match hotspot.state()? {
             State::On => {
-                // Somebody else already did it. Leave it alone, including on reconnect.
-                info!(
-                    uplink = %hotspot.uplink_profile,
-                    "hotspot is already on; leaving it under manual control"
-                );
+                // Only worth mentioning if it's broadcasting an SSID we didn't configure --
+                // if it matches ours, this is just our own hotspot, started on an earlier
+                // tick, still running.
+                let is_ours = hotspot
+                    .current_ssid()
+                    .is_ok_and(|ssid| ssid == self.cfg.hotspot.ssid);
+                if !is_ours {
+                    // Somebody else already configured and started it. Leave it alone,
+                    // including on reconnect.
+                    info!(
+                        uplink = %hotspot.uplink_profile,
+                        "hotspot is already on with a different configuration; leaving it under manual control"
+                    );
+                }
                 Ok(())
             }
             State::InTransition => {
@@ -180,7 +195,7 @@ impl<'a> Monitor<'a> {
 
     /// Take the hotspot back down after Wi-Fi returns.
     fn try_stop(&mut self) -> Result<()> {
-        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot.uplink_adapter)?;
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
 
         match hotspot.state()? {
             State::Off => {
@@ -248,7 +263,9 @@ impl<'a> Monitor<'a> {
             self.last_state_change = now;
         }
         let since_state_change = now.duration_since(self.last_state_change).as_secs();
-        let to_send = self.last_status.with_field("t", since_state_change.to_string());
+        let to_send = self
+            .last_status
+            .with_field("t", since_state_change.to_string());
 
         let Some(companion) = CompanionConn::new(self.cfg.companion) else {
             if self.log_missing_companion {
@@ -360,7 +377,7 @@ struct LiveHotspot {
 /// since the most common cause -- the uplink has no connection profile right now -- is
 /// routine, not worth alarming over every few seconds.
 fn query_hotspot(cfg: &Config) -> Option<LiveHotspot> {
-    let hotspot = match Hotspot::for_uplink(&cfg.hotspot.uplink_adapter) {
+    let hotspot = match Hotspot::for_uplink(&cfg.hotspot) {
         Ok(h) => h,
         Err(e) => {
             debug!("hotspot status unavailable: {e:#}");
@@ -416,6 +433,7 @@ uplink_adapter = "Ethernet"
             friendly_name: friendly.into(),
             description: description.into(),
             is_ethernet: false,
+            is_wifi: false,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }

@@ -144,11 +144,11 @@ fn real_main() -> Result<()> {
         }
         Command::Status => diagnostics::print_status(&cfg),
         Command::Start => {
-            let hotspot = Hotspot::for_uplink(&cfg.hotspot.uplink_adapter)?;
+            let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
             hotspot.start(&cfg.hotspot)
         }
         Command::Stop => {
-            let hotspot = Hotspot::for_uplink(&cfg.hotspot.uplink_adapter)?;
+            let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
             hotspot.stop()
         }
         Command::Service {

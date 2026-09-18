@@ -13,6 +13,7 @@ use windows::Networking::NetworkOperators::{
     TetheringOperationalState, TetheringWiFiBand,
 };
 
+use crate::adapters::Adapter;
 use crate::blocking::block_on;
 use crate::config::{Band, HotspotConfig};
 
@@ -75,8 +76,8 @@ impl Hotspot {
     ///
     /// The manager is deliberately not cached across polls: the uplink profile
     /// disappears when its adapter is unplugged, and a stale manager would keep failing.
-    pub fn for_uplink(adapter_name: &str) -> Result<Self> {
-        let (profile, profile_name) = find_uplink_profile(adapter_name)?;
+    pub fn for_uplink(cfg: &HotspotConfig) -> Result<Self> {
+        let (profile, profile_name) = find_uplink_profile(cfg)?;
 
         match NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(&profile)
         {
@@ -203,21 +204,29 @@ impl Hotspot {
 
 /// Locate the connection profile to use as the hotspot's uplink.
 ///
-/// `adapter_name` is either a specific adapter -- matched against its friendly name or
-/// hardware description (via IP Helper), then the network profile name as a fallback, so
-/// either spelling in the config works -- or the literal [`crate::config::AUTO_UPLINK`]
-/// (`"auto"`), which instead considers every currently connected network. The hotspot's
-/// own virtual adapter is always excluded from auto-selection so it can never end up
-/// sharing itself.
+/// `cfg.uplink_adapter` is either a specific adapter -- matched against its friendly
+/// name or hardware description (via IP Helper), then the network profile name as a
+/// fallback, so either spelling in the config works -- or the literal
+/// [`crate::config::AUTO_UPLINK`] (`"auto"`), which instead considers every currently
+/// connected network. The hotspot's own virtual adapter, and whatever `cfg.hotspot_adapter`
+/// resolves to (see [`resolve_hotspot_adapter`]), are always excluded: an adapter can't be
+/// both its own uplink and its own hotspot -- one Wi-Fi radio can't reliably act as both a
+/// client and an access point at once, which is why that combination tends to let clients
+/// associate but never receive an IP address.
 ///
 /// One adapter can carry several profiles -- remembered networks it is not currently
-/// using still show up. Sharing one of those would fail with
-/// `NetworkLimitedConnectivity`, so among the matches the one with the best connectivity
-/// wins; a tie is broken in favor of a wired Ethernet adapter over Wi-Fi (or any other
-/// interface type). This applies whenever more than one profile matches, whether that's
-/// because of auto-selection or because a named adapter has several stored profiles.
-pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, String)> {
-    let auto = adapter_name.trim().eq_ignore_ascii_case(crate::config::AUTO_UPLINK);
+/// using still show up. Among the matches, a wired Ethernet adapter always wins over any
+/// other adapter type outright, regardless of connectivity -- Ethernet is the
+/// predictable, always-safe choice to share, and this app does not care whether the
+/// uplink itself has internet access (only that connecting to it works). Connectivity
+/// rank (`NetworkLimitedConnectivity` is what sharing a merely-remembered, not actually
+/// connected, profile would fail with) only breaks a tie between candidates that are
+/// equally Ethernet, or equally not. This applies whenever more than one profile
+/// matches, whether that's because of auto-selection or because a named adapter has
+/// several stored profiles.
+pub fn find_uplink_profile(cfg: &HotspotConfig) -> Result<(ConnectionProfile, String)> {
+    let adapter_name = cfg.uplink_adapter.as_str();
+    let auto = cfg.is_auto_uplink();
 
     let profiles = NetworkInformation::GetConnectionProfiles()
         .context("enumerating network connection profiles")?;
@@ -231,9 +240,11 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
     } else {
         adapters.iter().filter(|a| a.matches(adapter_name)).collect()
     };
+    let hotspot_adapter = resolve_hotspot_adapter(&cfg.hotspot_adapter, &adapters);
 
     let mut seen: Vec<String> = Vec::new();
-    let mut best: Option<((u8, bool), ConnectionProfile, String)> = None;
+    let mut best: Option<((bool, u8), ConnectionProfile, String)> = None;
+    let mut excluded_as_hotspot_adapter = false;
 
     for profile in &profiles {
         let profile_name = profile
@@ -274,6 +285,11 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
             continue;
         }
 
+        if hotspot_adapter.excludes(matched_adapter) {
+            excluded_as_hotspot_adapter = true;
+            continue;
+        }
+
         let score = uplink_score(level, is_ethernet);
         if best.as_ref().is_none_or(|(best_score, _, _)| score > *best_score) {
             let label = adapter_label.unwrap_or_else(|| profile_name.clone());
@@ -282,7 +298,7 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
     }
 
     if let Some((score, profile, label)) = best {
-        if score.0 < RANK_INTERNET {
+        if score.1 < RANK_INTERNET {
             // This function is now polled every tick for the console status line, so this
             // stays at debug: a real failure to start surfaces loudly from start() itself
             // (TetheringOperationStatus::NetworkLimitedConnectivity), which is the moment
@@ -293,6 +309,22 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
             );
         }
         return Ok((profile, label));
+    }
+
+    if excluded_as_hotspot_adapter {
+        bail!(
+            "the only usable network(s) found are also needed to host the hotspot itself, \
+             so none of them can be used as its uplink too (one Wi-Fi radio can't reliably \
+             act as both a client and an access point at once). Connect a wired Ethernet \
+             uplink, add another Wi-Fi adapter, or set hotspot.hotspot_adapter and \
+             hotspot.uplink_adapter explicitly in autospot.toml. Connected networks right \
+             now: {}.",
+            if seen.is_empty() {
+                "none".to_string()
+            } else {
+                seen.join(", ")
+            }
+        );
     }
 
     if auto {
@@ -319,6 +351,63 @@ pub fn find_uplink_profile(adapter_name: &str) -> Result<(ConnectionProfile, Str
     )
 }
 
+/// Which adapter (if any) Windows will use to broadcast the hotspot's own Wi-Fi access
+/// point, resolved from `hotspot_adapter` config so it can be excluded from uplink
+/// candidacy.
+pub(crate) enum HotspotAdapter<'a> {
+    /// Confidently resolved, possibly to "no such adapter is currently present".
+    Known(Option<&'a Adapter>),
+    /// `hotspot_adapter = "auto"` and more than one Wi-Fi adapter is present, so which
+    /// one Windows would actually use can't be determined. Every Wi-Fi adapter is
+    /// treated as a potential hotspot adapter (and excluded) until this is configured
+    /// explicitly.
+    Ambiguous,
+}
+
+impl HotspotAdapter<'_> {
+    /// Should `candidate` be excluded from uplink candidacy because it's the (or a
+    /// possible) hotspot adapter?
+    pub(crate) fn excludes(&self, candidate: Option<&Adapter>) -> bool {
+        match self {
+            HotspotAdapter::Known(Some(hotspot)) => {
+                candidate.is_some_and(|a| a.guid == hotspot.guid)
+            }
+            HotspotAdapter::Known(None) => false,
+            HotspotAdapter::Ambiguous => candidate.is_some_and(|a| a.is_wifi),
+        }
+    }
+
+    /// A short human-readable description, for diagnostics output.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            HotspotAdapter::Known(Some(a)) => a.friendly_name.clone(),
+            HotspotAdapter::Known(None) => "none detected".to_string(),
+            HotspotAdapter::Ambiguous => "multiple Wi-Fi adapters present".to_string(),
+        }
+    }
+}
+
+/// Resolve `hotspot_adapter` (see its doc comment in [`HotspotConfig`]) against the
+/// currently present adapters.
+pub(crate) fn resolve_hotspot_adapter<'a>(
+    hotspot_adapter: &str,
+    adapters: &'a [Adapter],
+) -> HotspotAdapter<'a> {
+    if !crate::config::is_auto(hotspot_adapter) {
+        return HotspotAdapter::Known(adapters.iter().find(|a| a.matches(hotspot_adapter)));
+    }
+
+    let mut wifi_adapters = adapters.iter().filter(|a| a.is_wifi);
+    let Some(first) = wifi_adapters.next() else {
+        return HotspotAdapter::Known(None);
+    };
+    if wifi_adapters.next().is_some() {
+        HotspotAdapter::Ambiguous
+    } else {
+        HotspotAdapter::Known(Some(first))
+    }
+}
+
 const RANK_INTERNET: u8 = 3;
 
 /// Rank profiles so the one actually carrying internet is preferred as the uplink.
@@ -331,12 +420,14 @@ fn rank_connectivity(level: Option<NetworkConnectivityLevel>) -> u8 {
     }
 }
 
-/// Break a connectivity-rank tie in favour of Ethernet -- a wired link is the more
-/// predictable choice to share when two candidates are otherwise equally good. Tuple
-/// comparison is lexicographic and `false < true`, so connectivity rank always dominates
-/// and Ethernet only decides a tie.
-fn uplink_score(level: Option<NetworkConnectivityLevel>, is_ethernet: bool) -> (u8, bool) {
-    (rank_connectivity(level), is_ethernet)
+/// Prefer a wired Ethernet adapter over any other adapter type outright -- a wired link
+/// is the predictable, always-safe choice to share, unlike Wi-Fi (which can't reliably
+/// also host the hotspot) or anything else. Connectivity rank only breaks a tie between
+/// candidates that are equally Ethernet, or equally not. Tuple comparison is
+/// lexicographic and `false < true`, so `is_ethernet` dominates and connectivity rank
+/// only decides ties within the same Ethernet-ness.
+fn uplink_score(level: Option<NetworkConnectivityLevel>, is_ethernet: bool) -> (bool, u8) {
+    (is_ethernet, rank_connectivity(level))
 }
 
 fn describe_connectivity(level: Option<NetworkConnectivityLevel>) -> &'static str {
@@ -395,6 +486,18 @@ fn describe_capability(capability: TetheringCapability) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::core::GUID;
+
+    fn adapter(guid: u32, is_ethernet: bool, is_wifi: bool) -> Adapter {
+        Adapter {
+            guid: GUID::from_values(guid, 0, 0, [0; 8]),
+            friendly_name: format!("adapter-{guid}"),
+            description: String::new(),
+            is_ethernet,
+            is_wifi,
+            ipv4: Vec::new(),
+        }
+    }
 
     #[test]
     fn winrt_states_map_onto_our_state_enum() {
@@ -446,19 +549,92 @@ mod tests {
     }
 
     #[test]
-    fn ethernet_breaks_a_tie_in_connectivity_rank() {
+    fn ethernet_always_outranks_a_non_ethernet_adapter() {
+        // Even a barely-connected Ethernet adapter beats a fully-connected non-Ethernet
+        // one -- this app doesn't care about the uplink's own internet access, and a
+        // wired link is always the safe, predictable choice over anything else.
         assert!(
-            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), true)
+            uplink_score(Some(NetworkConnectivityLevel::None), true)
                 > uplink_score(Some(NetworkConnectivityLevel::InternetAccess), false)
         );
     }
 
     #[test]
-    fn connectivity_rank_still_dominates_over_ethernet() {
+    fn connectivity_rank_breaks_a_tie_within_the_same_ethernet_ness() {
         assert!(
-            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), false)
+            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), true)
                 > uplink_score(Some(NetworkConnectivityLevel::LocalAccess), true)
         );
+        assert!(
+            uplink_score(Some(NetworkConnectivityLevel::InternetAccess), false)
+                > uplink_score(Some(NetworkConnectivityLevel::LocalAccess), false)
+        );
+    }
+
+    #[test]
+    fn resolves_hotspot_adapter_automatically_with_exactly_one_wifi_adapter() {
+        let ethernet = adapter(1, true, false);
+        let wifi = adapter(2, false, true);
+        let adapters = [ethernet, wifi.clone()];
+        let resolved = resolve_hotspot_adapter("auto", &adapters);
+        assert!(matches!(resolved, HotspotAdapter::Known(Some(a)) if a.guid == wifi.guid));
+    }
+
+    #[test]
+    fn auto_resolution_is_none_without_any_wifi_adapter() {
+        let adapters = [adapter(1, true, false)];
+        let resolved = resolve_hotspot_adapter("auto", &adapters);
+        assert!(matches!(resolved, HotspotAdapter::Known(None)));
+    }
+
+    #[test]
+    fn auto_resolution_is_ambiguous_with_two_wifi_adapters() {
+        let adapters = [adapter(1, false, true), adapter(2, false, true)];
+        let resolved = resolve_hotspot_adapter("auto", &adapters);
+        assert!(matches!(resolved, HotspotAdapter::Ambiguous));
+    }
+
+    #[test]
+    fn a_named_hotspot_adapter_is_matched_by_friendly_name() {
+        let wifi = adapter(2, false, true);
+        let adapters = [adapter(1, true, false), wifi.clone()];
+        let resolved = resolve_hotspot_adapter(&wifi.friendly_name, &adapters);
+        assert!(matches!(resolved, HotspotAdapter::Known(Some(a)) if a.guid == wifi.guid));
+    }
+
+    #[test]
+    fn a_named_hotspot_adapter_not_currently_present_resolves_to_none() {
+        let adapters = [adapter(1, true, false)];
+        let resolved = resolve_hotspot_adapter("some other adapter", &adapters);
+        assert!(matches!(resolved, HotspotAdapter::Known(None)));
+    }
+
+    #[test]
+    fn known_hotspot_adapter_excludes_only_itself() {
+        let hotspot = adapter(1, false, true);
+        let other = adapter(2, true, false);
+        let resolution = HotspotAdapter::Known(Some(&hotspot));
+        assert!(resolution.excludes(Some(&hotspot)));
+        assert!(!resolution.excludes(Some(&other)));
+        assert!(!resolution.excludes(None));
+    }
+
+    #[test]
+    fn known_none_excludes_nothing() {
+        let other = adapter(2, true, false);
+        let resolution: HotspotAdapter = HotspotAdapter::Known(None);
+        assert!(!resolution.excludes(Some(&other)));
+        assert!(!resolution.excludes(None));
+    }
+
+    #[test]
+    fn ambiguous_excludes_every_wifi_adapter_but_not_others() {
+        let wifi = adapter(1, false, true);
+        let ethernet = adapter(2, true, false);
+        let resolution = HotspotAdapter::Ambiguous;
+        assert!(resolution.excludes(Some(&wifi)));
+        assert!(!resolution.excludes(Some(&ethernet)));
+        assert!(!resolution.excludes(None));
     }
 
     #[test]
