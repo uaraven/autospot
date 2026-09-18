@@ -70,6 +70,9 @@ enum Command {
 enum ServiceAction {
     /// Register autospot as an auto-start Windows service and start it
     Install,
+    /// Stop the service, then start it again -- e.g. after editing autospot.toml, since
+    /// the service only reads the config file once, at startup
+    Restart,
     /// Stop (if running) and unregister the service
     Remove,
     /// Print whether the service is installed and its current state
@@ -114,6 +117,9 @@ fn real_main() -> Result<()> {
         Command::Service {
             action: ServiceAction::Status,
         } => return service::print_status(),
+        Command::Service {
+            action: ServiceAction::Restart,
+        } => return service::restart(),
         _ => {}
     }
 
@@ -154,7 +160,7 @@ fn real_main() -> Result<()> {
         Command::Service {
             action: ServiceAction::Install,
         } => service::install(&config_path),
-        Command::Service { .. } => unreachable!("Remove/Status/Run handled above"),
+        Command::Service { .. } => unreachable!("Restart/Remove/Status/Run handled above"),
     }
 }
 
@@ -308,6 +314,12 @@ mod tests {
             parse(&["service", "status"]).command,
             Some(Command::Service {
                 action: ServiceAction::Status
+            })
+        );
+        assert_eq!(
+            parse(&["service", "restart"]).command,
+            Some(Command::Service {
+                action: ServiceAction::Restart
             })
         );
     }

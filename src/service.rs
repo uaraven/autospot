@@ -105,6 +105,39 @@ pub fn remove() -> Result<()> {
     Ok(())
 }
 
+/// Stop the service, then start it again -- e.g. after editing autospot.toml, since the
+/// service only reads the config file once, when it starts. Leaves the existing Service
+/// Control Manager registration (and its `--config` path) untouched; use
+/// `autospot service install` if the service isn't installed at all yet.
+pub fn restart() -> Result<()> {
+    require_elevation("restarting")?;
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(elevation_friendly_error)?;
+
+    let service = match manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(service) => service,
+        Err(e) if is_service_missing(&e) => anyhow::bail!(
+            "autospot service is not installed; use `autospot service install` first"
+        ),
+        Err(e) => return Err(elevation_friendly_error(e)),
+    };
+
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        service.stop().context("stopping the autospot service")?;
+        wait_for_stopped(&service)?;
+    }
+    service
+        .start(&[] as &[&OsStr])
+        .context("starting the autospot service")?;
+
+    println!("autospot service restarted.");
+    Ok(())
+}
+
 fn wait_for_stopped(service: &windows_service::service::Service) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
