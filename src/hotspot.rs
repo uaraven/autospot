@@ -1,5 +1,6 @@
 //! Mobile Hotspot control via WinRT `NetworkOperatorTetheringManager`.
 
+use std::future::IntoFuture;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -14,7 +15,6 @@ use windows::Networking::NetworkOperators::{
 };
 
 use crate::adapters::Adapter;
-use crate::blocking::block_on;
 use crate::config::{Band, HotspotConfig};
 
 /// Tethering operations talk to the Wi-Fi driver and can take a few seconds; this is a
@@ -62,6 +62,17 @@ impl Band {
             Band::SixGigahertz => TetheringWiFiBand::SixGigahertz,
         }
     }
+}
+
+/// Await a WinRT async operation, giving up after `OPERATION_TIMEOUT` -- a backstop so a
+/// wedged driver cannot hang the watchdog loop forever.
+async fn await_op<F>(op: F, what: &str) -> Result<F::Output>
+where
+    F: IntoFuture,
+{
+    tokio::time::timeout(OPERATION_TIMEOUT, async { op.await })
+        .await
+        .map_err(|_| anyhow!("{what} did not complete within {OPERATION_TIMEOUT:?}"))
 }
 
 /// A tethering manager bound to one uplink connection profile.
@@ -125,14 +136,14 @@ impl Hotspot {
     }
 
     /// Apply the configured SSID/passphrase/band and switch the hotspot on.
-    pub fn start(&self, cfg: &HotspotConfig) -> Result<()> {
-        self.configure(cfg)?;
+    pub async fn start(&self, cfg: &HotspotConfig) -> Result<()> {
+        self.configure(cfg).await?;
 
         let op = self
             .manager
             .StartTetheringAsync()
             .context("StartTetheringAsync")?;
-        let result = block_on(op, OPERATION_TIMEOUT, "StartTetheringAsync")??;
+        let result = await_op(op, "StartTetheringAsync").await??;
 
         match result.Status()? {
             TetheringOperationStatus::Success => {
@@ -152,12 +163,12 @@ impl Hotspot {
     }
 
     /// Switch the hotspot off.
-    pub fn stop(&self) -> Result<()> {
+    pub async fn stop(&self) -> Result<()> {
         let op = self
             .manager
             .StopTetheringAsync()
             .context("StopTetheringAsync")?;
-        let result = block_on(op, OPERATION_TIMEOUT, "StopTetheringAsync")??;
+        let result = await_op(op, "StopTetheringAsync").await??;
 
         match result.Status()? {
             TetheringOperationStatus::Success => {
@@ -173,7 +184,7 @@ impl Hotspot {
     }
 
     /// Push SSID, passphrase and band into the access point configuration.
-    fn configure(&self, cfg: &HotspotConfig) -> Result<()> {
+    async fn configure(&self, cfg: &HotspotConfig) -> Result<()> {
         let ap = self
             .manager
             .GetCurrentAccessPointConfiguration()
@@ -195,7 +206,7 @@ impl Hotspot {
             .manager
             .ConfigureAccessPointAsync(&ap)
             .context("ConfigureAccessPointAsync")?;
-        block_on(op, OPERATION_TIMEOUT, "ConfigureAccessPointAsync")??;
+        await_op(op, "ConfigureAccessPointAsync").await??;
 
         debug!(ssid = %cfg.ssid, band = ?cfg.band, "access point configured");
         Ok(())

@@ -1,5 +1,7 @@
+use std::time::Instant;
+
 use serialport::*;
-use tracing::{debug, trace};
+use tracing::{debug, error, trace, warn};
 
 use crate::{config::CompanionConfig, status::Status};
 
@@ -74,6 +76,62 @@ impl CompanionConn {
         }
 
         Ok(())
+    }
+}
+
+/// A companion connection's outgoing state: what was last sent to it, and since when the
+/// "s" field has held its current value. Owning this alongside the connection (rather
+/// than in the caller) keeps "what does the companion currently know" in one place.
+pub struct CompanionSession {
+    cfg: CompanionConfig,
+    /// What was last sent to the companion, so only the changed fields need re-sending.
+    last_status: Status,
+    /// When the "s" field last actually changed, so outgoing updates can tell the
+    /// companion how long the current state has held.
+    last_state_change: Instant,
+    log_missing_companion: bool,
+}
+
+impl CompanionSession {
+    pub fn new(cfg: CompanionConfig) -> Self {
+        Self {
+            cfg,
+            last_status: Status::default(),
+            last_state_change: Instant::now(),
+            log_missing_companion: true,
+        }
+    }
+
+    /// Diff `status` against what was last sent and forward only the changed fields to
+    /// the companion microcontroller, tagged with "t": seconds since the "s" field
+    /// itself last changed -- e.g. how long Wi-Fi has been disconnected. Resolves the
+    /// serial port fresh on every call (see `CompanionConn::new`) so a companion that is
+    /// unplugged and replugged -- possibly under a different COM port -- is still found.
+    /// Updates `self.last_status`/`self.last_state_change` on every call, even when
+    /// there is no companion to send to, so both stay accurate for whenever one shows up.
+    pub fn report(&mut self, now: Instant, status: Status) {
+        let changed = status.diff(&self.last_status);
+        self.last_status = status;
+
+        if changed.contains_key("s") {
+            self.last_state_change = now;
+        }
+        let since_state_change = now.duration_since(self.last_state_change).as_secs();
+        let to_send = self
+            .last_status
+            .with_field("t", since_state_change.to_string());
+
+        let Some(companion) = CompanionConn::new(self.cfg) else {
+            if self.log_missing_companion {
+                warn!("no companion device found");
+                self.log_missing_companion = false;
+            }
+            return;
+        };
+        self.log_missing_companion = true;
+        if let Err(e) = companion.write_status(&to_send) {
+            error!("could not send status to companion: {e:#}");
+        }
     }
 }
 

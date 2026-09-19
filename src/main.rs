@@ -3,22 +3,21 @@
 //! See `docs/implementation.md` for the design and `docs/status.md` for build status.
 
 mod adapters;
-mod blocking;
 mod companion;
 mod config;
 mod diagnostics;
 mod hotspot;
-mod monitor;
+mod policy;
 mod service;
 mod status;
 mod watchdog;
 mod wifi;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use tokio::sync::Notify;
 use tracing::error;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -146,22 +145,34 @@ fn real_main() -> Result<()> {
                      in the foreground. Check `autospot service status` for details."
                 );
             }
-            monitor::run(&cfg, &config_path, &AtomicBool::new(false))
+            // Never notified, so the loop runs until the process is killed -- same as
+            // the console `run` command's behaviour before adopting tokio.
+            current_thread_runtime()?.block_on(watchdog::run(&cfg, &config_path, &Notify::new()))
         }
         Command::Status => diagnostics::print_status(&cfg),
         Command::Start => {
             let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
-            hotspot.start(&cfg.hotspot)
+            current_thread_runtime()?.block_on(hotspot.start(&cfg.hotspot))
         }
         Command::Stop => {
             let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
-            hotspot.stop()
+            current_thread_runtime()?.block_on(hotspot.stop())
         }
         Command::Service {
             action: ServiceAction::Install,
         } => service::install(&config_path),
         Command::Service { .. } => unreachable!("Restart/Remove/Status/Run handled above"),
     }
+}
+
+/// A single-threaded tokio runtime. The WinRT tethering calls are the only async work in
+/// this app; a current-thread runtime never moves their futures across OS threads, which
+/// keeps COM apartment affinity out of the picture entirely.
+fn current_thread_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("building the tokio runtime")
 }
 
 /// Directory holding the executable; the default config path resolves against it

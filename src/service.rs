@@ -7,11 +7,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use tokio::sync::Notify;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -256,13 +256,13 @@ fn service_main() -> Result<()> {
     let cfg = Config::load(&config_path)?;
     let _guard = crate::init_file_logging(&cfg, &program_data_log_dir(), false)?;
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let handler_stop_flag = Arc::clone(&stop_flag);
+    let stop = Arc::new(Notify::new());
+    let handler_stop = Arc::clone(&stop);
 
     let status_handle = service_control_handler::register(SERVICE_NAME, move |control| match control
     {
         ServiceControl::Stop | ServiceControl::Shutdown => {
-            handler_stop_flag.store(true, Ordering::Relaxed);
+            handler_stop.notify_one();
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -288,7 +288,14 @@ fn service_main() -> Result<()> {
     )?;
     tracing::info!("autospot service started");
 
-    let result = crate::monitor::run(&cfg, &config_path, &stop_flag);
+    // Runs on the SCM dispatcher's own thread, reached through a fixed FFI signature
+    // that can't itself be async -- so this builds and drives its own runtime rather
+    // than sharing one with the rest of the process.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("building the tokio runtime")?;
+    let result = rt.block_on(crate::watchdog::run(&cfg, &config_path, &stop));
     if let Err(ref e) = result {
         tracing::error!("autospot service watchdog loop exited with an error: {e:#}");
     }
