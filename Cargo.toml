@@ -1,6 +1,6 @@
 [package]
 name = "autospot"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2024"
 license = "Unlicense"
 authors = ["Oles Voronin <oles@voronin.cc>"]
@@ -14,7 +14,8 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_NetworkManagement_WiFi", "Networking_Connectivity", "Networking_NetworkOperators", "Foundation", "Foundation_Collections", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_NetworkManagement_WiFi", "Networking_Connectivity", "Networking_NetworkOperators", "Foundation", "Foundation_Collections", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_UI_Shell"] }
+windows-service = "0.7"
 
 [profile.release]
 opt-level = 3

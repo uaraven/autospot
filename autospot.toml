@@ -27,13 +27,19 @@ passphrase = "changeme123"
 # setting a band; when it does not, Autospot logs a warning and uses the driver default.
 band = "Auto"
 
-# The adapter whose internet connection is shared, as named in Windows
-# ("Ethernet", "Wi-Fi", ...). The hardware description works too. The adapter must be
-# plugged in and up for the hotspot to have anything to share.
-# `autospot.exe status` lists the exact names available on this machine.
-# Use "auto" instead of a name to let Autospot pick whichever connected network currently
-# has the best connectivity.
+# The adapter whose connection is shared, as named in Windows ("Ethernet", "Wi-Fi", ...).
+# The hardware description works too. The adapter must be plugged in and up for the
+# hotspot to have anything to share. `autospot.exe status` lists the exact names
+# available on this machine.
+# Use "auto" instead of a name to let Autospot pick an adapter. Ethernet adapters are
+# preferred over other adapter types
 uplink_adapter = "auto"
+
+# Adapter Windows will use to broadcast the hotspot's own Wi-Fi access point. "auto" (the
+# default) resolves this automatically when exactly one Wi-Fi adapter is present. With
+# two or more Wi-Fi adapters it's ambiguous which one Windows will actually use, so set
+# this explicitly (along with uplink_adapter, if needed) in that case.
+hotspot_adapter = "auto"
 
 [companion]
 # Enables sending Wi-Fi/hotspot status to a companion microcontroller over the serial port.
@@ -50,13 +56,18 @@ enabled = true
 
 [logging]
 # error | warn | info | debug | trace
-# Level for the rotated log file. Defaults to "error" to keep routine status lines out
-# of the file; the console (below) is where they're meant to be read live.
+# Level for the rotated log file when running as a console app.
 file_level = "error"
 
 # Level for the console.
 stdout_level = "info"
 
-# Relative paths are resolved against the directory holding autospot.exe. The file is
-# rotated daily, producing autospot.log.YYYY-MM-DD.
+# Level for the rotated log file when running as the Windows service. There is no
+# console in that mode, so the file is the only place output is read
+service_level = "info"
+
+# Name of the log file. When running as an application the logs will be written to
+# %USERPROFILE%\Documents\autospot\logs, and when running as a service the logs will
+# be written to %ProgramData%\autospot\logs.
+# The file is rotated daily, producing autospot.log.YYYY-MM-DD.
 path = "autospot.log"

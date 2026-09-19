@@ -2,9 +2,10 @@
 //! response, and prints the console status line and optional companion status update.
 
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::{self, Adapter};
@@ -43,7 +44,7 @@ impl<'a> Monitor<'a> {
         }
     }
 
-    fn run(&mut self, config_path: &Path) -> Result<()> {
+    fn run(&mut self, config_path: &Path, stop: &AtomicBool) -> Result<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             config = %config_path.display(),
@@ -55,7 +56,7 @@ impl<'a> Monitor<'a> {
             "autospot starting"
         );
 
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             let now = Instant::now();
 
             let (wifi_ok, status) = match wifi::query() {
@@ -75,11 +76,17 @@ impl<'a> Monitor<'a> {
             let live_hotspot = query_hotspot(self.cfg);
 
             if self.cfg.companion.enabled {
-                self.update_companion_status(now, wifi_ok, &status, &adapters_snapshot, &live_hotspot);
+                self.update_companion_status(
+                    now,
+                    wifi_ok,
+                    &status,
+                    &adapters_snapshot,
+                    &live_hotspot,
+                );
             }
 
             if !wifi_ok {
-                std::thread::sleep(self.cfg.poll_interval());
+                sleep_or_stop(self.cfg.poll_interval(), stop);
                 continue;
             }
 
@@ -99,8 +106,11 @@ impl<'a> Monitor<'a> {
 
             self.handle_intent(now, &status, intent);
 
-            std::thread::sleep(self.cfg.poll_interval());
+            sleep_or_stop(self.cfg.poll_interval(), stop);
         }
+
+        info!("autospot stopping");
+        Ok(())
     }
 
     /// React to what the watchdog decided this tick: log it, and bring the hotspot up
@@ -151,15 +161,24 @@ impl<'a> Monitor<'a> {
             );
         }
 
-        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot.uplink_adapter)?;
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
 
         match hotspot.state()? {
             State::On => {
-                // Somebody else already did it. Leave it alone, including on reconnect.
-                info!(
-                    uplink = %hotspot.uplink_profile,
-                    "hotspot is already on; leaving it under manual control"
-                );
+                // Only worth mentioning if it's broadcasting an SSID we didn't configure --
+                // if it matches ours, this is just our own hotspot, started on an earlier
+                // tick, still running.
+                let is_ours = hotspot
+                    .current_ssid()
+                    .is_ok_and(|ssid| ssid == self.cfg.hotspot.ssid);
+                if !is_ours {
+                    // Somebody else already configured and started it. Leave it alone,
+                    // including on reconnect.
+                    info!(
+                        uplink = %hotspot.uplink_profile,
+                        "hotspot is already on with a different configuration; leaving it under manual control"
+                    );
+                }
                 Ok(())
             }
             State::InTransition => {
@@ -176,7 +195,7 @@ impl<'a> Monitor<'a> {
 
     /// Take the hotspot back down after Wi-Fi returns.
     fn try_stop(&mut self) -> Result<()> {
-        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot.uplink_adapter)?;
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
 
         match hotspot.state()? {
             State::Off => {
@@ -244,7 +263,9 @@ impl<'a> Monitor<'a> {
             self.last_state_change = now;
         }
         let since_state_change = now.duration_since(self.last_state_change).as_secs();
-        let to_send = self.last_status.with_field("t", since_state_change.to_string());
+        let to_send = self
+            .last_status
+            .with_field("t", since_state_change.to_string());
 
         let Some(companion) = CompanionConn::new(self.cfg.companion) else {
             if self.log_missing_companion {
@@ -260,9 +281,27 @@ impl<'a> Monitor<'a> {
     }
 }
 
-/// The watchdog loop.
-pub fn run(cfg: &Config, config_path: &Path) -> Result<()> {
-    Monitor::new(cfg).run(config_path)
+/// The watchdog loop. Runs until `stop` is set to `true` (checked once per poll tick,
+/// with sub-second latency once set); pass a flag that's never written to run forever,
+/// as the console `run` command does.
+pub fn run(cfg: &Config, config_path: &Path, stop: &AtomicBool) -> Result<()> {
+    Monitor::new(cfg).run(config_path, stop)
+}
+
+/// Sleep for `duration`, but wake early -- within ~500ms -- if `stop` is set, so a
+/// service stop request doesn't have to wait out a full poll interval, which can be
+/// tens of seconds.
+fn sleep_or_stop(duration: Duration, stop: &AtomicBool) {
+    let step = Duration::from_millis(500);
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let this_step = step.min(remaining);
+        std::thread::sleep(this_step);
+        remaining -= this_step;
+    }
 }
 
 /// One readable line summarising what is true right now: Wi-Fi state and IP, hotspot
@@ -338,7 +377,7 @@ struct LiveHotspot {
 /// since the most common cause -- the uplink has no connection profile right now -- is
 /// routine, not worth alarming over every few seconds.
 fn query_hotspot(cfg: &Config) -> Option<LiveHotspot> {
-    let hotspot = match Hotspot::for_uplink(&cfg.hotspot.uplink_adapter) {
+    let hotspot = match Hotspot::for_uplink(&cfg.hotspot) {
         Ok(h) => h,
         Err(e) => {
             debug!("hotspot status unavailable: {e:#}");
@@ -368,12 +407,33 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn test_config() -> Config {
+        Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_returns_immediately_when_already_told_to_stop() {
+        let cfg = test_config();
+        let stop = AtomicBool::new(true);
+        let path = Path::new("autospot.toml");
+        assert!(run(&cfg, path, &stop).is_ok());
+    }
+
     fn adapter(friendly: &str, description: &str, ipv4: &[&str]) -> Adapter {
         Adapter {
             guid: windows::core::GUID::zeroed(),
             friendly_name: friendly.into(),
             description: description.into(),
             is_ethernet: false,
+            is_wifi: false,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
         }
     }

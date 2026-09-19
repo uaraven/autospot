@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::adapters;
 use crate::config::Config;
-use crate::hotspot::Hotspot;
+use crate::hotspot::{self, Hotspot};
 use crate::wifi;
 
 /// One-shot diagnostics, used to verify each piece by hand.
@@ -13,8 +13,11 @@ pub fn print_status(cfg: &Config) -> Result<()> {
     let adapters_snapshot = adapters::list().unwrap_or_default();
     let auto = cfg.hotspot.is_auto_uplink();
     // Resolved once up front so the adapter listing below and the hotspot section agree
-    // on which adapter auto mode actually picked.
-    let hotspot_result = Hotspot::for_uplink(&cfg.hotspot.uplink_adapter);
+    // on which adapter auto mode actually picked, and which one is excluded as the
+    // hotspot's own adapter.
+    let hotspot_adapter =
+        hotspot::resolve_hotspot_adapter(&cfg.hotspot.hotspot_adapter, &adapters_snapshot);
+    let hotspot_result = Hotspot::for_uplink(&cfg.hotspot);
     let resolved_label = hotspot_result
         .as_ref()
         .ok()
@@ -59,7 +62,9 @@ pub fn print_status(cfg: &Config) -> Result<()> {
         println!("  (none found, or enumeration failed -- see log)");
     }
     for a in &adapters_snapshot {
-        let marker = if auto {
+        let marker = if hotspot_adapter.excludes(Some(a)) {
+            " <== hotspot adapter (excluded from uplink)"
+        } else if auto {
             if resolved_label == Some(a.friendly_name.as_str()) {
                 " <== auto-selected uplink"
             } else {
@@ -75,16 +80,21 @@ pub fn print_status(cfg: &Config) -> Result<()> {
         } else {
             format!(", {}", a.ipv4.join(", "))
         };
-        println!("   '{}' ({}{ip}){marker}", a.friendly_name, a.description);
+        println!("   '{}' ({}{ip}) {marker}.", a.friendly_name, a.description);
     }
 
+    println!(
+        "\nHotspot adapter ('{}' -> {}):",
+        cfg.hotspot.hotspot_adapter,
+        hotspot_adapter.describe()
+    );
     if auto {
         println!(
-            "\nHotspot (uplink 'auto' -> {}):",
+            "Hotspot (uplink 'auto' -> {}):",
             resolved_label.unwrap_or("?")
         );
     } else {
-        println!("\nHotspot (uplink '{}'):", cfg.hotspot.uplink_adapter);
+        println!("Hotspot (uplink '{}'):", cfg.hotspot.uplink_adapter);
     }
     match hotspot_result {
         Ok(h) => {
