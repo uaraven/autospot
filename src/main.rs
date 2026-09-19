@@ -1,27 +1,29 @@
 //! Autospot -- Wi-Fi watchdog that turns Windows' Mobile Hotspot on when Wi-Fi stays down.
 //!
-//! See `docs/implementation.md` for the design and `docs/status.md` for build status.
+//! This file is the command line and nothing else: it resolves the config path, decides
+//! what logging the chosen command needs, and hands off. `watchdog` runs the loop,
+//! `service` deals with the Service Control Manager, `diagnostics` prints `status`.
 
 mod adapters;
 mod companion;
 mod config;
 mod diagnostics;
 mod hotspot;
+mod logging;
 mod policy;
 mod service;
 mod status;
+mod uplink;
 mod watchdog;
 mod wifi;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use tokio::sync::Notify;
 use tracing::error;
-use tracing_subscriber::Layer as _;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::config::Config;
 use crate::hotspot::Hotspot;
@@ -94,46 +96,40 @@ fn main() -> std::process::ExitCode {
 }
 
 fn real_main() -> Result<()> {
+    use ServiceAction::{Remove, Restart, Run, Status};
+
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Command::Run);
-
-    match &command {
-        // The Service Control Manager launches us with this hidden variant; it does its
-        // own config loading and logging setup and never returns until the service stops.
-        Command::Service {
-            action: ServiceAction::Run,
-        } => {
-            let config_path = match cli.config.or(cli.bare_config) {
-                Some(path) => path,
-                None => default_config_path()?,
-            };
-            return service::run_dispatcher(config_path);
-        }
-        // Neither needs a config file to exist.
-        Command::Service {
-            action: ServiceAction::Remove,
-        } => return service::remove(),
-        Command::Service {
-            action: ServiceAction::Status,
-        } => return service::print_status(),
-        Command::Service {
-            action: ServiceAction::Restart,
-        } => return service::restart(),
-        _ => {}
-    }
-
     let config_path = match cli.config.or(cli.bare_config) {
         Some(path) => path,
         None => default_config_path()?,
     };
-    let cfg = Config::load(&config_path)?;
+
+    match cli.command.unwrap_or(Command::Run) {
+        // Service management talks to the Service Control Manager and nothing else -- no
+        // config file to read, no logging to set up. `run` is the hidden variant the SCM
+        // itself launches; it sets up both on its own and does not return until the
+        // service stops. `install` is the one action that wants the config, so it goes
+        // through `run_with_config` below with everything else.
+        Command::Service { action: Run } => service::run_dispatcher(config_path),
+        Command::Service { action: Remove } => service::remove(),
+        Command::Service { action: Restart } => service::restart(),
+        Command::Service { action: Status } => service::print_status(),
+        command => run_with_config(&command, &config_path),
+    }
+}
+
+/// Every other command reads `autospot.toml` first -- including `service install`, which
+/// validates it rather than registering a service that would fail on every start.
+fn run_with_config(command: &Command, config_path: &Path) -> Result<()> {
+    let cfg = Config::load(config_path)?;
 
     // `status` is a one-shot diagnostic command; file logging would only get in the way.
-    let _guard = if command == Command::Status {
-        init_console_logging(&cfg);
-        None
-    } else {
-        Some(init_logging(&cfg)?)
+    let _guard = match command {
+        Command::Status => {
+            logging::init_console_only(&cfg);
+            None
+        }
+        _ => Some(logging::init(&cfg, logging::Mode::Console)?),
     };
 
     match command {
@@ -145,139 +141,36 @@ fn real_main() -> Result<()> {
                      in the foreground. Check `autospot service status` for details."
                 );
             }
-            // Never notified, so the loop runs until the process is killed -- same as
-            // the console `run` command's behaviour before adopting tokio.
-            current_thread_runtime()?.block_on(watchdog::run(&cfg, &config_path, &Notify::new()))
+            // Never notified, so the loop runs until the process is killed.
+            block_on(watchdog::run(&cfg, config_path, &Notify::new()))
         }
         Command::Status => diagnostics::print_status(&cfg),
-        Command::Start => {
-            let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
-            current_thread_runtime()?.block_on(hotspot.start(&cfg.hotspot))
-        }
-        Command::Stop => {
-            let hotspot = Hotspot::for_uplink(&cfg.hotspot)?;
-            current_thread_runtime()?.block_on(hotspot.stop())
-        }
-        Command::Service {
-            action: ServiceAction::Install,
-        } => service::install(&config_path),
-        Command::Service { .. } => unreachable!("Restart/Remove/Status/Run handled above"),
+        Command::Start => block_on(Hotspot::for_uplink(&cfg.hotspot)?.start(&cfg.hotspot)),
+        Command::Stop => block_on(Hotspot::for_uplink(&cfg.hotspot)?.stop()),
+        Command::Service { .. } => service::install(config_path),
     }
 }
 
-/// A single-threaded tokio runtime. The WinRT tethering calls are the only async work in
-/// this app; a current-thread runtime never moves their futures across OS threads, which
-/// keeps COM apartment affinity out of the picture entirely.
-fn current_thread_runtime() -> Result<tokio::runtime::Runtime> {
+/// Run one async operation to completion on a fresh single-threaded tokio runtime. The
+/// WinRT tethering calls are the only async work in this app; a current-thread runtime
+/// never moves their futures across OS threads, which keeps COM apartment affinity out of
+/// the picture entirely.
+pub(crate) fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .context("building the tokio runtime")
+        .context("building the tokio runtime")?
+        .block_on(future)
 }
 
-/// Directory holding the executable; the default config path resolves against it
-/// because Task Scheduler does not guarantee a useful working directory. Log paths use
-/// `user_documents_log_dir`/`service::program_data_log_dir` instead -- see there for why.
-fn exe_dir() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("locating the autospot executable")?;
-    Ok(exe
-        .parent()
-        .context("the autospot executable has no parent directory")?
-        .to_path_buf())
-}
-
+/// The config file next to the executable. Resolved against the executable's own
+/// directory because Task Scheduler does not guarantee a useful working directory.
 fn default_config_path() -> Result<PathBuf> {
-    Ok(exe_dir()?.join(config::DEFAULT_FILE_NAME))
-}
-
-/// Base directory for log files in console/application mode:
-/// `%USERPROFILE%\Documents\autospot\logs`. Falls back to the current directory if
-/// `USERPROFILE` isn't set, rather than failing outright. Service mode uses a different
-/// base -- see `service::program_data_log_dir`.
-fn user_documents_log_dir() -> PathBuf {
-    match std::env::var_os("USERPROFILE") {
-        Some(profile) => PathBuf::from(profile)
-            .join("Documents")
-            .join("autospot")
-            .join("logs"),
-        None => PathBuf::from("."),
-    }
-}
-
-fn init_console_logging(cfg: &Config) {
-    let level = config::parse_level(&cfg.logging.stdout_level).unwrap_or(tracing::Level::INFO);
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .try_init();
-}
-
-/// Log to a daily-rotated file under `base_dir` (a relative `cfg.logging.path` resolves
-/// against it; an absolute one overrides it entirely), optionally also to the console.
-/// The file's level depends on mode: `file_level` in console mode, where the console is
-/// the primary place output is read live and the file defaults to `error` so it doesn't
-/// fill up with routine status lines; `service_level` in service mode (`with_stdout`
-/// `false`), where there is no console and the file is the only place output is read.
-pub(crate) fn init_file_logging(
-    cfg: &Config,
-    base_dir: &Path,
-    with_stdout: bool,
-) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file_level = if with_stdout {
-        config::parse_level(&cfg.logging.file_level).unwrap_or(tracing::Level::ERROR)
-    } else {
-        config::parse_level(&cfg.logging.service_level).unwrap_or(tracing::Level::INFO)
-    };
-
-    let path = if cfg.logging.path.is_absolute() {
-        cfg.logging.path.clone()
-    } else {
-        base_dir.join(&cfg.logging.path)
-    };
-    let directory = path
+    let exe = std::env::current_exe().context("locating the autospot executable")?;
+    let dir = exe
         .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let file_name = path
-        .file_name()
-        .context("logging.path has no file name")?
-        .to_owned();
-
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("creating the log directory {}", directory.display()))?;
-
-    let appender = tracing_appender::rolling::daily(&directory, &file_name);
-    let (file_writer, guard) = tracing_appender::non_blocking(appender);
-
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_writer)
-        .with_ansi(false)
-        .with_target(false)
-        .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
-            file_level,
-        ));
-    let stdout_layer = with_stdout.then(|| {
-        let stdout_level =
-            config::parse_level(&cfg.logging.stdout_level).unwrap_or(tracing::Level::INFO);
-        tracing_subscriber::fmt::layer()
-            .with_target(false)
-            .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
-                stdout_level,
-            ))
-    });
-
-    tracing_subscriber::registry()
-        .with(file_layer)
-        .with(stdout_layer)
-        .init();
-
-    Ok(guard)
-}
-
-fn init_logging(cfg: &Config) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    init_file_logging(cfg, &user_documents_log_dir(), true)
+        .context("the autospot executable has no parent directory")?;
+    Ok(dir.join(config::DEFAULT_FILE_NAME))
 }
 
 #[cfg(test)]
@@ -289,6 +182,10 @@ mod tests {
             .chain(args.iter().copied())
             .collect();
         Cli::try_parse_from(argv).unwrap()
+    }
+
+    fn service(action: ServiceAction) -> Option<Command> {
+        Some(Command::Service { action })
     }
 
     #[test]
@@ -311,51 +208,36 @@ mod tests {
     fn recognises_each_service_subcommand() {
         assert_eq!(
             parse(&["service", "install"]).command,
-            Some(Command::Service {
-                action: ServiceAction::Install
-            })
+            service(ServiceAction::Install)
         );
         assert_eq!(
             parse(&["service", "remove"]).command,
-            Some(Command::Service {
-                action: ServiceAction::Remove
-            })
+            service(ServiceAction::Remove)
         );
         assert_eq!(
             parse(&["service", "status"]).command,
-            Some(Command::Service {
-                action: ServiceAction::Status
-            })
+            service(ServiceAction::Status)
         );
         assert_eq!(
             parse(&["service", "restart"]).command,
-            Some(Command::Service {
-                action: ServiceAction::Restart
-            })
+            service(ServiceAction::Restart)
         );
     }
 
     #[test]
     fn service_run_is_hidden_but_still_parses_with_a_config_path() {
         let cli = parse(&["service", "run", "--config", "C:\\autospot\\autospot.toml"]);
+        assert_eq!(cli.command, service(ServiceAction::Run));
         assert_eq!(
-            cli.command,
-            Some(Command::Service {
-                action: ServiceAction::Run
-            })
+            cli.config,
+            Some(PathBuf::from("C:\\autospot\\autospot.toml"))
         );
-        assert_eq!(cli.config, Some(PathBuf::from("C:\\autospot\\autospot.toml")));
     }
 
     #[test]
     fn top_level_status_is_not_confused_with_service_status() {
         assert_eq!(parse(&["status"]).command, Some(Command::Status));
-        assert_ne!(
-            parse(&["status"]).command,
-            Some(Command::Service {
-                action: ServiceAction::Status
-            })
-        );
+        assert_ne!(parse(&["status"]).command, service(ServiceAction::Status));
     }
 
     #[test]

@@ -3,18 +3,25 @@
 //! WinRT's `NetworkAdapter` only exposes an interface GUID, but the config names the
 //! uplink the way the user sees it in Windows ("Ethernet"). This module bridges the two.
 
-use anyhow::{bail, Result};
-use windows::core::GUID;
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-    GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+    GetIfEntry2, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::{
-    NdisPhysicalMedium802_3, NdisPhysicalMediumNative802_11, NdisPhysicalMediumWirelessLan,
-    NET_LUID_LH, NDIS_PHYSICAL_MEDIUM,
+    NDIS_PHYSICAL_MEDIUM, NET_LUID_LH, NdisPhysicalMedium802_3, NdisPhysicalMediumNative802_11,
+    NdisPhysicalMediumWirelessLan,
 };
-use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS, AF_INET, AF_UNSPEC};
+use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN, SOCKET_ADDRESS};
+use windows::core::GUID;
+
+/// The default ICS subnet Windows hands the Mobile Hotspot's own virtual adapter. Used as
+/// a heuristic to identify that adapter -- there is no direct API for it -- so it is
+/// never picked as its own uplink and so its IP can be reported as the hotspot's address.
+/// Not a documented guarantee, but observed consistently in testing and cheap to fall
+/// back away from if it ever changes.
+pub const HOTSPOT_SUBNET_PREFIX: &str = "192.168.137.";
 
 /// One network adapter as Windows describes it.
 #[derive(Debug, Clone)]
@@ -39,13 +46,6 @@ pub struct Adapter {
     pub ipv4: Vec<String>,
 }
 
-/// The default ICS subnet Windows hands the Mobile Hotspot's own virtual adapter. Used as
-/// a heuristic to identify that adapter -- there is no direct API for it -- so it is
-/// never picked as its own uplink and so its IP can be reported as the hotspot's address.
-/// Not a documented guarantee, but observed consistently in testing and cheap to fall
-/// back away from if it ever changes.
-pub const HOTSPOT_SUBNET_PREFIX: &str = "192.168.137.";
-
 impl Adapter {
     /// Does this adapter answer to `name`, as written in the config?
     pub fn matches(&self, name: &str) -> bool {
@@ -55,7 +55,9 @@ impl Adapter {
 
     /// Is this the virtual adapter Windows creates for the Mobile Hotspot's own network?
     pub fn is_hotspot_virtual_adapter(&self) -> bool {
-        self.ipv4.iter().any(|ip| ip.starts_with(HOTSPOT_SUBNET_PREFIX))
+        self.ipv4
+            .iter()
+            .any(|ip| ip.starts_with(HOTSPOT_SUBNET_PREFIX))
     }
 }
 
@@ -80,14 +82,17 @@ pub fn hotspot_ip(adapters: &[Adapter]) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Enough for a few dozen adapters; `GetAdaptersAddresses` says how much more it needs if
+/// not, and the adapter list can change between the two calls -- hence the retries.
+const INITIAL_BUFFER_BYTES: u32 = 16 * 1024;
+const MAX_ATTEMPTS: usize = 4;
+
 /// Enumerate every network adapter on the machine.
 pub fn list() -> Result<Vec<Adapter>> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = INITIAL_BUFFER_BYTES;
 
-    // Ask for the buffer size, then retry; the adapter list can change in between, so
-    // allow a few attempts before giving up.
-    let mut size = 16 * 1024u32;
-    for _ in 0..4 {
+    for _ in 0..MAX_ATTEMPTS {
         let mut buffer = vec![0u8; size as usize];
         let rc = unsafe {
             GetAdaptersAddresses(
@@ -99,22 +104,25 @@ pub fn list() -> Result<Vec<Adapter>> {
             )
         };
 
-        match rc {
-            rc if rc == ERROR_SUCCESS.0 => {
-                // SAFETY: on success the buffer holds a linked list of adapter records.
-                return Ok(unsafe { collect(buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH) });
-            }
-            // No adapters at all is an empty list, not an error.
-            rc if rc == ERROR_NO_DATA.0 => return Ok(Vec::new()),
-            // `size` now holds the required length; loop and retry.
-            rc if rc == ERROR_BUFFER_OVERFLOW.0 => continue,
-            rc => bail!("GetAdaptersAddresses failed with error {rc}"),
+        if rc == ERROR_SUCCESS.0 {
+            // SAFETY: on success the buffer holds a linked list of adapter records.
+            return Ok(unsafe { collect(buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH) });
+        }
+        // No adapters at all is an empty list, not an error.
+        if rc == ERROR_NO_DATA.0 {
+            return Ok(Vec::new());
+        }
+        // Anything but "your buffer was too small" is a real failure. On overflow `size`
+        // now holds the required length, so the next attempt will fit.
+        if rc != ERROR_BUFFER_OVERFLOW.0 {
+            bail!("GetAdaptersAddresses failed with error {rc}");
         }
     }
 
     bail!("GetAdaptersAddresses kept reporting a too-small buffer")
 }
 
+/// Walk the `IP_ADAPTER_ADDRESSES_LH` linked list into owned [`Adapter`]s.
 unsafe fn collect(mut current: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
     let mut adapters = Vec::new();
     while !current.is_null() {
@@ -146,11 +154,7 @@ unsafe fn physical_medium(luid: NET_LUID_LH) -> Option<NDIS_PHYSICAL_MEDIUM> {
     // SAFETY: `row` is a valid, fully zeroed `MIB_IF_ROW2` with only the lookup key set,
     // exactly what `GetIfEntry2` expects to fill in.
     let rc = unsafe { GetIfEntry2(&mut row) };
-    if rc == ERROR_SUCCESS {
-        Some(row.PhysicalMediumType)
-    } else {
-        None
-    }
+    (rc == ERROR_SUCCESS).then_some(row.PhysicalMediumType)
 }
 
 /// Walk `FirstUnicastAddress` and collect every IPv4 address assigned to this adapter.
@@ -183,11 +187,8 @@ unsafe fn sockaddr_to_ipv4(addr: &SOCKET_ADDRESS) -> Option<String> {
     let sin = unsafe { &*(addr.lpSockaddr as *const SOCKADDR_IN) };
     // S_addr's bytes are already in dotted-decimal order regardless of host endianness,
     // since it aliases the same memory as the S_un_b per-octet view.
-    let octets = unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes();
-    Some(format!(
-        "{}.{}.{}.{}",
-        octets[0], octets[1], octets[2], octets[3]
-    ))
+    let [a, b, c, d] = unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes();
+    Some(format!("{a}.{b}.{c}.{d}"))
 }
 
 /// `AdapterName` is the interface GUID in `{8-4-4-4-12}` text form.
@@ -211,48 +212,64 @@ unsafe fn pwstr_to_string(ptr: *mut u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Parse `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` into a `GUID`.
+/// Parse `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` into a `GUID`. The braces IP Helper
+/// writes are optional here, but `GUID::try_from` itself rejects them.
 fn parse_guid(text: &str) -> Option<GUID> {
-    let t = text.trim().trim_start_matches('{').trim_end_matches('}');
-    let parts: Vec<&str> = t.split('-').collect();
-    if parts.len() != 5 || parts[0].len() != 8 || parts[4].len() != 12 {
-        return None;
+    let bare = text.trim().trim_start_matches('{').trim_end_matches('}');
+    GUID::try_from(bare).ok()
+}
+
+#[cfg(test)]
+impl Adapter {
+    /// A bare adapter for tests: `id` is both its GUID and its friendly name, so adapters
+    /// can be told apart by identity. The builders below set whatever else a test needs.
+    pub(crate) fn test(id: u32) -> Self {
+        Self {
+            guid: GUID::from_values(id, 0, 0, [0; 8]),
+            friendly_name: format!("adapter-{id}"),
+            description: String::new(),
+            is_ethernet: false,
+            is_wifi: false,
+            ipv4: Vec::new(),
+        }
     }
 
-    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
-    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
-    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
-
-    let tail = format!("{}{}", parts[3], parts[4]);
-    if tail.len() != 16 {
-        return None;
-    }
-    let mut data4 = [0u8; 8];
-    for (i, slot) in data4.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).ok()?;
+    pub(crate) fn named(mut self, friendly_name: &str, description: &str) -> Self {
+        self.friendly_name = friendly_name.to_string();
+        self.description = description.to_string();
+        self
     }
 
-    Some(GUID::from_values(data1, data2, data3, data4))
+    pub(crate) fn ethernet(mut self) -> Self {
+        self.is_ethernet = true;
+        self
+    }
+
+    pub(crate) fn wifi(mut self) -> Self {
+        self.is_wifi = true;
+        self
+    }
+
+    pub(crate) fn with_ipv4(mut self, addresses: &[&str]) -> Self {
+        self.ipv4 = addresses.iter().map(ToString::to_string).collect();
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn adapter(friendly: &str, description: &str, ipv4: &[&str]) -> Adapter {
-        Adapter {
-            guid: GUID::zeroed(),
-            friendly_name: friendly.into(),
-            description: description.into(),
-            is_ethernet: false,
-            is_wifi: false,
-            ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
-        }
+    /// The adapter used throughout: a wired NIC, named the way Windows shows it.
+    fn ethernet() -> Adapter {
+        Adapter::test(1)
+            .named("Ethernet", "Realtek PCIe GbE Family Controller")
+            .ethernet()
     }
 
     #[test]
     fn matches_the_friendly_name_case_insensitively() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
+        let a = ethernet();
         assert!(a.matches("Ethernet"));
         assert!(a.matches("ethernet"));
         assert!(a.matches("  Ethernet  "));
@@ -260,61 +277,62 @@ mod tests {
 
     #[test]
     fn matches_the_hardware_description_too() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
-        assert!(a.matches("Realtek PCIe GbE Family Controller"));
+        assert!(ethernet().matches("Realtek PCIe GbE Family Controller"));
     }
 
     #[test]
     fn does_not_match_a_different_adapter() {
-        let a = adapter("Ethernet", "Realtek PCIe GbE Family Controller", &[]);
+        let a = ethernet();
         assert!(!a.matches("Wi-Fi"));
         assert!(!a.matches("Ether"));
     }
 
     #[test]
     fn recognises_the_hotspot_virtual_adapter_by_its_ics_subnet() {
-        let mut a = adapter(
-            "Local Area Connection* 2",
-            "Microsoft Wi-Fi Direct Virtual Adapter",
-            &[],
-        );
+        let a = Adapter::test(2).named("Local Area Connection* 2", "Wi-Fi Direct Virtual Adapter");
         assert!(!a.is_hotspot_virtual_adapter());
-        a.ipv4.push("192.168.137.1".to_string());
-        assert!(a.is_hotspot_virtual_adapter());
+        assert!(a.with_ipv4(&["192.168.137.1"]).is_hotspot_virtual_adapter());
     }
 
     #[test]
     fn does_not_mistake_a_normal_adapter_for_the_hotspot_one() {
-        let mut a = adapter("Wi-Fi", "Intel(R) Wireless-AC 7260", &[]);
-        a.ipv4.push("192.168.10.218".to_string());
+        let a = Adapter::test(2)
+            .named("Wi-Fi", "Intel(R) Wireless-AC 7260")
+            .with_ipv4(&["192.168.10.218"]);
         assert!(!a.is_hotspot_virtual_adapter());
     }
 
     #[test]
     fn ipv4_of_matches_by_hardware_description_case_insensitively() {
-        let adapters = [adapter("Ethernet", "Realtek PCIe GbE", &["10.0.0.5"])];
-        assert_eq!(ipv4_of(&adapters, "realtek pcie gbe"), Some("10.0.0.5"));
+        let adapters = [ethernet().with_ipv4(&["10.0.0.5"])];
+        assert_eq!(
+            ipv4_of(&adapters, "realtek pcie gbe family controller"),
+            Some("10.0.0.5")
+        );
         assert_eq!(ipv4_of(&adapters, "nope"), None);
     }
 
     #[test]
     fn ipv4_of_is_none_when_the_adapter_has_no_address() {
-        let adapters = [adapter("Ethernet", "Realtek PCIe GbE", &[])];
-        assert_eq!(ipv4_of(&adapters, "Realtek PCIe GbE"), None);
+        let adapters = [ethernet()];
+        assert_eq!(
+            ipv4_of(&adapters, "Realtek PCIe GbE Family Controller"),
+            None
+        );
     }
 
     #[test]
     fn hotspot_ip_finds_the_ics_subnet_address() {
         let adapters = [
-            adapter("Wi-Fi", "desc1", &["192.168.10.218"]),
-            adapter("Local Area Connection* 2", "desc2", &["192.168.137.1"]),
+            Adapter::test(1).with_ipv4(&["192.168.10.218"]),
+            Adapter::test(2).with_ipv4(&["192.168.137.1"]),
         ];
         assert_eq!(hotspot_ip(&adapters), Some("192.168.137.1"));
     }
 
     #[test]
     fn hotspot_ip_is_none_without_a_matching_subnet() {
-        let adapters = [adapter("Wi-Fi", "desc1", &["192.168.10.218"])];
+        let adapters = [Adapter::test(1).with_ipv4(&["192.168.10.218"])];
         assert_eq!(hotspot_ip(&adapters), None);
     }
 

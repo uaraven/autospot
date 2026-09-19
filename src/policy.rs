@@ -1,10 +1,14 @@
 //! The decision logic: when should the hotspot go on, and when should it go off?
 //!
-//! This module is pure -- it takes the current time and a Wi-Fi boolean and returns an
-//! intent. It never touches Wi-Fi or the hotspot itself; that's `watchdog`'s job, which
+//! This module is pure -- it takes the current time and whether Wi-Fi is up, and returns
+//! an intent. It never touches Wi-Fi or the hotspot itself; that's `watchdog`'s job, which
 //! is what makes the rules here testable on their own.
 
 use std::time::{Duration, Instant};
+
+/// How long to wait after a failed start before trying again, so a hotspot that cannot
+/// come up doesn't get hammered once per poll.
+const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 /// What the caller should do about the current tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +18,7 @@ pub enum Intent {
     /// Wi-Fi just dropped; the countdown starts now.
     WifiLost,
     /// Wi-Fi is down but the threshold has not elapsed yet.
-    Waiting { down_for: Duration, remaining: Duration },
+    Waiting { remaining: Duration },
     /// Wi-Fi has been down long enough: bring the hotspot up if it is not already.
     StartHotspot { down_for: Duration },
     /// A previous start attempt failed; holding off before trying again.
@@ -27,9 +31,17 @@ pub enum Intent {
     },
 }
 
+/// What to do with a hotspot we started once Wi-Fi comes back, from
+/// `monitor.auto_disable_on_reconnect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnReconnect {
+    StopHotspot,
+    LeaveHotspotOn,
+}
+
 pub struct Policy {
     threshold: Duration,
-    auto_disable_on_reconnect: bool,
+    on_reconnect: OnReconnect,
     retry_backoff: Duration,
     /// When the current run of disconnection began; `None` while Wi-Fi is up.
     disconnected_since: Option<Instant>,
@@ -40,22 +52,18 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn new(threshold: Duration, auto_disable_on_reconnect: bool) -> Self {
-        Self::with_backoff(
-            threshold,
-            auto_disable_on_reconnect,
-            Duration::from_secs(60),
-        )
+    pub fn new(threshold: Duration, on_reconnect: OnReconnect) -> Self {
+        Self::with_backoff(threshold, on_reconnect, RETRY_BACKOFF)
     }
 
     pub fn with_backoff(
         threshold: Duration,
-        auto_disable_on_reconnect: bool,
+        on_reconnect: OnReconnect,
         retry_backoff: Duration,
     ) -> Self {
         Self {
             threshold,
-            auto_disable_on_reconnect,
+            on_reconnect,
             retry_backoff,
             disconnected_since: None,
             started_by_us: false,
@@ -66,40 +74,34 @@ impl Policy {
     /// Feed one poll result in and get back what to do.
     pub fn evaluate(&mut self, now: Instant, wifi_connected: bool) -> Intent {
         if wifi_connected {
-            return match self.disconnected_since.take() {
-                Some(since) => {
-                    self.retry_after = None;
-                    Intent::WifiRestored {
-                        down_for: now.saturating_duration_since(since),
-                        stop_hotspot: self.started_by_us && self.auto_disable_on_reconnect,
-                    }
-                }
-                None => Intent::Idle,
+            let Some(since) = self.disconnected_since.take() else {
+                return Intent::Idle;
+            };
+            self.retry_after = None;
+            return Intent::WifiRestored {
+                down_for: now.saturating_duration_since(since),
+                stop_hotspot: self.started_by_us && self.on_reconnect == OnReconnect::StopHotspot,
             };
         }
 
-        let since = match self.disconnected_since {
-            Some(since) => since,
-            None => {
-                self.disconnected_since = Some(now);
-                return Intent::WifiLost;
-            }
+        let Some(since) = self.disconnected_since else {
+            self.disconnected_since = Some(now);
+            return Intent::WifiLost;
         };
 
         let down_for = now.saturating_duration_since(since);
         if down_for < self.threshold {
             return Intent::Waiting {
-                down_for,
-                remaining: self.threshold - down_for,
+                remaining: self.threshold.saturating_sub(down_for),
             };
         }
 
-        if let Some(retry_after) = self.retry_after {
-            if now < retry_after {
-                return Intent::HoldingForRetry {
-                    retry_in: retry_after.saturating_duration_since(now),
-                };
-            }
+        if let Some(retry_after) = self.retry_after
+            && now < retry_after
+        {
+            return Intent::HoldingForRetry {
+                retry_in: retry_after.saturating_duration_since(now),
+            };
         }
 
         Intent::StartHotspot { down_for }
@@ -120,7 +122,6 @@ impl Policy {
     pub fn record_start_failure(&mut self, now: Instant) {
         self.retry_after = Some(now + self.retry_backoff);
     }
-
 }
 
 #[cfg(test)]
@@ -130,14 +131,22 @@ mod tests {
     const THRESHOLD: Duration = Duration::from_secs(120);
 
     fn policy() -> (Policy, Instant) {
-        (Policy::new(THRESHOLD, true), Instant::now())
+        (
+            Policy::new(THRESHOLD, OnReconnect::StopHotspot),
+            Instant::now(),
+        )
+    }
+
+    /// `t0 + secs`, to keep the timeline in the tests below readable.
+    fn at(t0: Instant, secs: u64) -> Instant {
+        t0 + Duration::from_secs(secs)
     }
 
     #[test]
     fn stays_idle_while_wifi_is_up() {
         let (mut w, t0) = policy();
         assert_eq!(w.evaluate(t0, true), Intent::Idle);
-        assert_eq!(w.evaluate(t0 + Duration::from_secs(300), true), Intent::Idle);
+        assert_eq!(w.evaluate(at(t0, 300), true), Intent::Idle);
     }
 
     #[test]
@@ -152,14 +161,13 @@ mod tests {
         w.evaluate(t0, false);
 
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(5), false),
+            w.evaluate(at(t0, 5), false),
             Intent::Waiting {
-                down_for: Duration::from_secs(5),
                 remaining: Duration::from_secs(115),
             }
         );
         assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(119), false),
+            w.evaluate(at(t0, 119), false),
             Intent::Waiting { .. }
         ));
         assert_eq!(
@@ -174,11 +182,11 @@ mod tests {
     fn a_brief_blip_resets_the_countdown() {
         let (mut w, t0) = policy();
         w.evaluate(t0, false);
-        w.evaluate(t0 + Duration::from_secs(60), false);
+        w.evaluate(at(t0, 60), false);
 
         // Wi-Fi returns at t+70 before the threshold, so no hotspot was ever started.
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(70), true),
+            w.evaluate(at(t0, 70), true),
             Intent::WifiRestored {
                 down_for: Duration::from_secs(70),
                 stop_hotspot: false,
@@ -186,13 +194,13 @@ mod tests {
         );
 
         // Dropping again starts a fresh 120s countdown rather than resuming the old one.
-        assert_eq!(w.evaluate(t0 + Duration::from_secs(75), false), Intent::WifiLost);
+        assert_eq!(w.evaluate(at(t0, 75), false), Intent::WifiLost);
         assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(180), false),
+            w.evaluate(at(t0, 180), false),
             Intent::Waiting { .. }
         ));
         assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(195), false),
+            w.evaluate(at(t0, 195), false),
             Intent::StartHotspot { .. }
         ));
     }
@@ -205,7 +213,7 @@ mod tests {
         w.record_started();
 
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
+            w.evaluate(at(t0, 200), true),
             Intent::WifiRestored {
                 down_for: Duration::from_secs(200),
                 stop_hotspot: true,
@@ -219,7 +227,7 @@ mod tests {
         w.evaluate(t0, false);
         // No record_started(): the hotspot was already on, not switched on by us.
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
+            w.evaluate(at(t0, 200), true),
             Intent::WifiRestored {
                 down_for: Duration::from_secs(200),
                 stop_hotspot: false,
@@ -229,14 +237,14 @@ mod tests {
 
     #[test]
     fn honours_auto_disable_on_reconnect_being_off() {
-        let mut w = Policy::new(THRESHOLD, false);
+        let mut w = Policy::new(THRESHOLD, OnReconnect::LeaveHotspotOn);
         let t0 = Instant::now();
         w.evaluate(t0, false);
         w.evaluate(t0 + THRESHOLD, false);
         w.record_started();
 
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
+            w.evaluate(at(t0, 200), true),
             Intent::WifiRestored {
                 down_for: Duration::from_secs(200),
                 stop_hotspot: false,
@@ -246,7 +254,8 @@ mod tests {
 
     #[test]
     fn backs_off_after_a_failed_start_instead_of_retrying_every_poll() {
-        let mut w = Policy::with_backoff(THRESHOLD, true, Duration::from_secs(60));
+        let mut w =
+            Policy::with_backoff(THRESHOLD, OnReconnect::StopHotspot, Duration::from_secs(60));
         let t0 = Instant::now();
         w.evaluate(t0, false);
 
@@ -258,30 +267,34 @@ mod tests {
         w.record_start_failure(at_threshold);
 
         assert_eq!(
-            w.evaluate(at_threshold + Duration::from_secs(5), false),
+            w.evaluate(at(at_threshold, 5), false),
             Intent::HoldingForRetry {
                 retry_in: Duration::from_secs(55)
             }
         );
         assert!(matches!(
-            w.evaluate(at_threshold + Duration::from_secs(60), false),
+            w.evaluate(at(at_threshold, 60), false),
             Intent::StartHotspot { .. }
         ));
     }
 
     #[test]
     fn a_reconnect_clears_a_pending_retry_backoff() {
-        let mut w = Policy::with_backoff(THRESHOLD, true, Duration::from_secs(600));
+        let mut w = Policy::with_backoff(
+            THRESHOLD,
+            OnReconnect::StopHotspot,
+            Duration::from_secs(600),
+        );
         let t0 = Instant::now();
         w.evaluate(t0, false);
         let at_threshold = t0 + THRESHOLD;
         w.evaluate(at_threshold, false);
         w.record_start_failure(at_threshold);
 
-        w.evaluate(at_threshold + Duration::from_secs(10), true);
+        w.evaluate(at(at_threshold, 10), true);
 
         // Fresh outage: the old backoff must not delay the new attempt.
-        let t1 = at_threshold + Duration::from_secs(20);
+        let t1 = at(at_threshold, 20);
         w.evaluate(t1, false);
         assert!(matches!(
             w.evaluate(t1 + THRESHOLD, false),
@@ -312,7 +325,7 @@ mod tests {
 
         w.evaluate(t0, false);
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(10), true),
+            w.evaluate(at(t0, 10), true),
             Intent::WifiRestored {
                 down_for: Duration::from_secs(10),
                 stop_hotspot: false,

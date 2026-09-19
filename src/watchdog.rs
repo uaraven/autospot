@@ -12,13 +12,21 @@ use crate::adapters::{self, Adapter};
 use crate::companion::CompanionSession;
 use crate::config::Config;
 use crate::hotspot::{Hotspot, State};
-use crate::policy::{Intent, Policy};
+use crate::policy::{Intent, OnReconnect, Policy};
 use crate::status::{self, Status};
 use crate::wifi;
+
+/// The watchdog loop. Runs until `stop` is notified; pass a `Notify` that's never
+/// notified to run forever, as the console `run` command does.
+pub async fn run(cfg: &Config, config_path: &Path, stop: &Notify) -> Result<()> {
+    Watchdog::new(cfg).run(config_path, stop).await
+}
 
 /// The watchdog loop's persistent state, carried across ticks.
 struct Watchdog<'a> {
     cfg: &'a Config,
+    /// Our own hotspot's SSID, which never counts as Wi-Fi being back -- see
+    /// [`wifi::WifiStatus::active_interface`].
     ignore_ssid: Option<&'a str>,
     policy: Policy,
     companion: CompanionSession,
@@ -26,13 +34,16 @@ struct Watchdog<'a> {
 
 impl<'a> Watchdog<'a> {
     fn new(cfg: &'a Config) -> Self {
+        let on_reconnect = if cfg.monitor.auto_disable_on_reconnect {
+            OnReconnect::StopHotspot
+        } else {
+            OnReconnect::LeaveHotspotOn
+        };
+
         Self {
             cfg,
             ignore_ssid: Some(cfg.hotspot.ssid.as_str()),
-            policy: Policy::new(
-                cfg.disconnect_threshold(),
-                cfg.monitor.auto_disable_on_reconnect,
-            ),
+            policy: Policy::new(cfg.monitor.disconnect_threshold(), on_reconnect),
             companion: CompanionSession::new(cfg.companion),
         }
     }
@@ -50,60 +61,58 @@ impl<'a> Watchdog<'a> {
         );
 
         loop {
-            let now = Instant::now();
+            self.tick(Instant::now()).await;
 
-            let (wifi_ok, status) = match wifi::query() {
-                Ok(status) => (true, status),
-                // Treat an unreadable Wi-Fi stack as "state unknown": still worth a companion
-                // status update (status="unknown"), but not worth feeding a guess into the watchdog.
-                Err(e) => {
-                    warn!("could not read Wi-Fi state: {e:#}");
-                    (false, wifi::WifiStatus::default())
-                }
-            };
-
-            // Best-effort snapshots shared by the console status line and the companion
-            // status update; a failure here (e.g. a transient IP Helper hiccup) should never
-            // stop the loop.
-            let adapters_snapshot = adapters::list().unwrap_or_default();
-            let live_hotspot = query_hotspot(self.cfg);
-
-            if self.cfg.companion.enabled {
-                let companion_status =
-                    self.companion_status(wifi_ok, &status, &adapters_snapshot, &live_hotspot);
-                self.companion.report(now, companion_status);
-            }
-
-            if !wifi_ok {
-                if !sleep_or_stop(self.cfg.poll_interval(), stop).await {
-                    break;
-                }
-                continue;
-            }
-
-            let connected = status.is_connected(self.ignore_ssid);
-            let intent = self.policy.evaluate(now, connected);
-
-            info!(
-                "{}",
-                status_line(
-                    &status,
-                    &adapters_snapshot,
-                    self.ignore_ssid,
-                    &intent,
-                    &live_hotspot
-                )
-            );
-
-            self.handle_intent(now, &status, intent).await;
-
-            if !sleep_or_stop(self.cfg.poll_interval(), stop).await {
-                break;
+            // Wait out the poll interval, unless we are asked to stop first.
+            tokio::select! {
+                _ = tokio::time::sleep(self.cfg.monitor.poll_interval()) => {}
+                _ = stop.notified() => break,
             }
         }
 
         info!("autospot stopping");
         Ok(())
+    }
+
+    /// One poll: read where things stand, report it, and act on it.
+    async fn tick(&mut self, now: Instant) {
+        let (wifi_ok, status) = match wifi::query() {
+            Ok(status) => (true, status),
+            // Treat an unreadable Wi-Fi stack as "state unknown": still worth a companion
+            // status update (status="unknown"), but not worth feeding a guess into the
+            // policy.
+            Err(e) => {
+                warn!("could not read Wi-Fi state: {e:#}");
+                (false, wifi::WifiStatus::default())
+            }
+        };
+
+        // Best-effort snapshots shared by the console status line and the companion
+        // status update; a failure here (e.g. a transient IP Helper hiccup) should never
+        // stop the loop.
+        let adapters = adapters::list().unwrap_or_default();
+        let live_hotspot = query_hotspot(self.cfg);
+
+        if self.cfg.companion.enabled {
+            let report = self.companion_status(wifi_ok, &status, &adapters, live_hotspot.as_ref());
+            self.companion.report(now, report);
+        }
+
+        if !wifi_ok {
+            return;
+        }
+
+        let intent = self
+            .policy
+            .evaluate(now, status.is_connected(self.ignore_ssid));
+
+        info!(
+            "{} | Hotspot: {}",
+            wifi_status_text(&status, &adapters, self.ignore_ssid, &intent),
+            hotspot_summary_text(live_hotspot.as_ref(), &adapters)
+        );
+
+        self.handle_intent(now, &status, intent).await;
     }
 
     /// React to what the policy decided this tick: log it, and bring the hotspot up or
@@ -136,11 +145,9 @@ impl<'a> Watchdog<'a> {
                     ssid = ?status.connected_ssid(self.ignore_ssid),
                     "Wi-Fi reconnected"
                 );
-                if stop_hotspot {
-                    if let Err(e) = self.try_stop().await {
-                        // Keep ownership so the next reconnect tick tries again.
-                        error!("could not stop the hotspot: {e:#}");
-                    }
+                // Keep ownership on failure so the next reconnect tick tries again.
+                if stop_hotspot && let Err(e) = self.try_stop().await {
+                    error!("could not stop the hotspot: {e:#}");
                 }
             }
         }
@@ -150,7 +157,8 @@ impl<'a> Watchdog<'a> {
     async fn try_start(&mut self, wifi_status: &wifi::WifiStatus) -> Result<()> {
         if !wifi_status.radio_enabled() {
             bail!(
-                "Wi-Fi is turned off; not starting the hotspot (Mobile Hotspot needs the Wi-Fi radio on to broadcast)"
+                "Wi-Fi is turned off; not starting the hotspot (Mobile Hotspot needs the \
+                 Wi-Fi radio on to broadcast)"
             );
         }
 
@@ -158,15 +166,14 @@ impl<'a> Watchdog<'a> {
 
         match hotspot.state()? {
             State::On => {
-                // Only worth mentioning if it's broadcasting an SSID we didn't configure --
-                // if it matches ours, this is just our own hotspot, started on an earlier
-                // tick, still running.
+                // Only worth mentioning if it's broadcasting an SSID we didn't configure
+                // -- if it matches ours, this is just our own hotspot, started on an
+                // earlier tick, still running. Somebody else's stays under manual
+                // control, including on reconnect.
                 let is_ours = hotspot
                     .current_ssid()
                     .is_ok_and(|ssid| ssid == self.cfg.hotspot.ssid);
                 if !is_ours {
-                    // Somebody else already configured and started it. Leave it alone,
-                    // including on reconnect.
                     info!(
                         uplink = %hotspot.uplink_profile,
                         "hotspot is already on with a different configuration; leaving it under manual control"
@@ -178,7 +185,7 @@ impl<'a> Watchdog<'a> {
                 debug!("hotspot is mid-transition; waiting for it to settle");
                 Ok(())
             }
-            _ => {
+            State::Off | State::Unknown => {
                 hotspot.start(&self.cfg.hotspot).await?;
                 self.policy.record_started();
                 Ok(())
@@ -200,7 +207,7 @@ impl<'a> Watchdog<'a> {
                 debug!("hotspot is mid-transition; will stop it on the next poll");
                 Ok(())
             }
-            _ => {
+            State::On | State::Unknown => {
                 hotspot.stop().await?;
                 self.policy.record_stopped();
                 Ok(())
@@ -215,109 +222,24 @@ impl<'a> Watchdog<'a> {
         wifi_ok: bool,
         status: &wifi::WifiStatus,
         adapters: &[Adapter],
-        live_hotspot: &Option<LiveHotspot>,
+        live_hotspot: Option<&LiveHotspot>,
     ) -> Status {
-        let radio_enabled = status.radio_enabled();
-        let wifi_snapshot = match status.active_interface(self.ignore_ssid) {
-            Some(iface) => status::WifiSnapshot {
-                wifi_ok,
-                radio_enabled,
-                connected: true,
-                ssid: iface.ssid.as_deref(),
-                ip_address: adapters::ipv4_of(adapters, &iface.description),
-            },
-            None => status::WifiSnapshot {
-                wifi_ok,
-                radio_enabled,
-                connected: false,
-                ssid: None,
-                ip_address: None,
-            },
+        let active = status.active_interface(self.ignore_ssid);
+        let wifi = status::WifiSnapshot {
+            wifi_ok,
+            radio_enabled: status.radio_enabled(),
+            connected: active.is_some(),
+            ssid: active.and_then(|iface| iface.ssid.as_deref()),
+            ip_address: active.and_then(|iface| adapters::ipv4_of(adapters, &iface.description)),
         };
-        let hotspot_snapshot = live_hotspot.as_ref().map(|h| status::HotspotSnapshot {
+        let hotspot = live_hotspot.map(|h| status::HotspotSnapshot {
             on: h.state == State::On,
             ssid: &self.cfg.hotspot.ssid,
             password: &self.cfg.hotspot.passphrase,
             ip_address: adapters::hotspot_ip(adapters),
         });
 
-        Status::new(&wifi_snapshot, hotspot_snapshot.as_ref())
-    }
-}
-
-/// The watchdog loop. Runs until `stop` is notified; pass a `Notify` that's never
-/// notified to run forever, as the console `run` command does.
-pub async fn run(cfg: &Config, config_path: &Path, stop: &Notify) -> Result<()> {
-    Watchdog::new(cfg).run(config_path, stop).await
-}
-
-/// Sleep for `duration`, but wake early if `stop` is notified. Returns `false` when the
-/// stop notification woke it, `true` when the full duration elapsed.
-async fn sleep_or_stop(duration: std::time::Duration, stop: &Notify) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(duration) => true,
-        _ = stop.notified() => false,
-    }
-}
-
-/// One readable line summarising what is true right now: Wi-Fi state and IP, hotspot
-/// state and IP, and (while waiting) a countdown -- printed to the console every tick.
-fn status_line(
-    status: &wifi::WifiStatus,
-    adapters: &[Adapter],
-    ignore_ssid: Option<&str>,
-    intent: &Intent,
-    live_hotspot: &Option<LiveHotspot>,
-) -> String {
-    format!(
-        "{} | Hotspot: {}",
-        wifi_status_text(status, adapters, ignore_ssid, intent),
-        hotspot_summary_text(live_hotspot, adapters)
-    )
-}
-
-/// The Wi-Fi half of the status line: connection, IP, and (while waiting) a countdown.
-/// Kept free of any Windows call of its own so it can be unit tested directly.
-fn wifi_status_text(
-    status: &wifi::WifiStatus,
-    adapters: &[Adapter],
-    ignore_ssid: Option<&str>,
-    intent: &Intent,
-) -> String {
-    let wifi_part = match status.active_interface(ignore_ssid) {
-        Some(iface) => format!(
-            "Wi-Fi: connected to '{}' ({})",
-            iface.ssid.as_deref().unwrap_or("?"),
-            adapters::ipv4_of(adapters, &iface.description).unwrap_or("no IP yet"),
-        ),
-        None => "Wi-Fi: disconnected".to_string(),
-    };
-
-    let countdown = match intent {
-        Intent::Waiting { remaining, .. } => format!(" (hotspot in {}s)", remaining.as_secs()),
-        Intent::HoldingForRetry { retry_in } => {
-            format!(" (retrying hotspot start in {}s)", retry_in.as_secs())
-        }
-        _ => String::new(),
-    };
-
-    format!("{wifi_part}{countdown}")
-}
-
-/// Render a `LiveHotspot` snapshot for the console status line. Pure, so it is unit
-/// tested directly.
-fn hotspot_summary_text(live: &Option<LiveHotspot>, adapters: &[Adapter]) -> String {
-    match live {
-        None => "off".to_string(),
-        Some(h) => match h.state {
-            State::On => match adapters::hotspot_ip(adapters) {
-                Some(ip) => format!("on (ssid='{}', ip={ip}, clients={})", h.ssid, h.clients),
-                None => format!("on (ssid='{}', clients={})", h.ssid, h.clients),
-            },
-            State::InTransition => "starting/stopping".to_string(),
-            State::Off => "off".to_string(),
-            State::Unknown => "unknown".to_string(),
-        },
+        Status::new(&wifi, hotspot.as_ref())
     }
 }
 
@@ -333,29 +255,69 @@ struct LiveHotspot {
 /// since the most common cause -- the uplink has no connection profile right now -- is
 /// routine, not worth alarming over every few seconds.
 fn query_hotspot(cfg: &Config) -> Option<LiveHotspot> {
-    let hotspot = match Hotspot::for_uplink(&cfg.hotspot) {
-        Ok(h) => h,
-        Err(e) => {
-            debug!("hotspot status unavailable: {e:#}");
-            return None;
-        }
-    };
-    let state = match hotspot.state() {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("could not read hotspot state: {e:#}");
-            return None;
-        }
-    };
-    let ssid = hotspot
-        .current_ssid()
-        .unwrap_or_else(|_| cfg.hotspot.ssid.clone());
-    let clients = hotspot.client_count().unwrap_or(0);
+    let hotspot = Hotspot::for_uplink(&cfg.hotspot)
+        .inspect_err(|e| debug!("hotspot status unavailable: {e:#}"))
+        .ok()?;
+    let state = hotspot
+        .state()
+        .inspect_err(|e| debug!("could not read hotspot state: {e:#}"))
+        .ok()?;
+
     Some(LiveHotspot {
         state,
-        ssid,
-        clients,
+        ssid: hotspot
+            .current_ssid()
+            .unwrap_or_else(|_| cfg.hotspot.ssid.clone()),
+        clients: hotspot.client_count().unwrap_or(0),
     })
+}
+
+/// The Wi-Fi half of the status line: connection, IP, and (while waiting) a countdown.
+/// Kept free of any Windows call of its own so it can be unit tested directly.
+fn wifi_status_text(
+    status: &wifi::WifiStatus,
+    adapters: &[Adapter],
+    ignore_ssid: Option<&str>,
+    intent: &Intent,
+) -> String {
+    let wifi = match status.active_interface(ignore_ssid) {
+        Some(iface) => format!(
+            "Wi-Fi: connected to '{}' ({})",
+            iface.ssid.as_deref().unwrap_or("?"),
+            adapters::ipv4_of(adapters, &iface.description).unwrap_or("no IP yet"),
+        ),
+        None => "Wi-Fi: disconnected".to_string(),
+    };
+
+    let countdown = match intent {
+        Intent::Waiting { remaining } => format!(" (hotspot in {}s)", remaining.as_secs()),
+        Intent::HoldingForRetry { retry_in } => {
+            format!(" (retrying hotspot start in {}s)", retry_in.as_secs())
+        }
+        _ => String::new(),
+    };
+
+    format!("{wifi}{countdown}")
+}
+
+/// The hotspot half of the status line. Pure, so it is unit tested directly.
+fn hotspot_summary_text(live: Option<&LiveHotspot>, adapters: &[Adapter]) -> String {
+    let Some(hotspot) = live else {
+        return "off".to_string();
+    };
+
+    match hotspot.state {
+        State::On => match adapters::hotspot_ip(adapters) {
+            Some(ip) => format!(
+                "on (ssid='{}', ip={ip}, clients={})",
+                hotspot.ssid, hotspot.clients
+            ),
+            None => format!("on (ssid='{}', clients={})", hotspot.ssid, hotspot.clients),
+        },
+        State::InTransition => "starting/stopping".to_string(),
+        State::Off => "off".to_string(),
+        State::Unknown => "unknown".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -384,17 +346,6 @@ uplink_adapter = "Ethernet"
         assert!(run(&cfg, path, &stop).await.is_ok());
     }
 
-    fn adapter(friendly: &str, description: &str, ipv4: &[&str]) -> Adapter {
-        Adapter {
-            guid: windows::core::GUID::zeroed(),
-            friendly_name: friendly.into(),
-            description: description.into(),
-            is_ethernet: false,
-            is_wifi: false,
-            ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
     fn connected_status(description: &str, ssid: &str) -> wifi::WifiStatus {
         wifi::WifiStatus {
             interfaces: vec![wifi::InterfaceStatus {
@@ -413,11 +364,9 @@ uplink_adapter = "Ethernet"
     #[test]
     fn wifi_status_text_shows_ssid_and_ip_when_connected() {
         let status = connected_status("Intel(R) Wireless-AC 7260", "banderstadt");
-        let adapters = [adapter(
-            "Wi-Fi",
-            "Intel(R) Wireless-AC 7260",
-            &["192.168.10.218"],
-        )];
+        let adapters = [Adapter::test(1)
+            .named("Wi-Fi", "Intel(R) Wireless-AC 7260")
+            .with_ipv4(&["192.168.10.218"])];
         assert_eq!(
             wifi_status_text(&status, &adapters, None, &Intent::Idle),
             "Wi-Fi: connected to 'banderstadt' (192.168.10.218)"
@@ -444,7 +393,6 @@ uplink_adapter = "Ethernet"
     #[test]
     fn wifi_status_text_appends_a_countdown_while_waiting() {
         let intent = Intent::Waiting {
-            down_for: Duration::from_secs(45),
             remaining: Duration::from_secs(75),
         };
         assert_eq!(
@@ -482,5 +430,29 @@ uplink_adapter = "Ethernet"
                 "Wi-Fi: disconnected"
             );
         }
+    }
+
+    #[test]
+    fn hotspot_summary_reports_off_when_there_is_nothing_to_report() {
+        assert_eq!(hotspot_summary_text(None, &[]), "off");
+    }
+
+    #[test]
+    fn hotspot_summary_reports_ssid_ip_and_clients_when_on() {
+        let live = LiveHotspot {
+            state: State::On,
+            ssid: "Fallback".to_string(),
+            clients: 2,
+        };
+        let adapters = [Adapter::test(1).with_ipv4(&["192.168.137.1"])];
+        assert_eq!(
+            hotspot_summary_text(Some(&live), &adapters),
+            "on (ssid='Fallback', ip=192.168.137.1, clients=2)"
+        );
+        // Without the ICS address there is no IP to show yet.
+        assert_eq!(
+            hotspot_summary_text(Some(&live), &[]),
+            "on (ssid='Fallback', clients=2)"
+        );
     }
 }
