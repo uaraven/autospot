@@ -7,20 +7,21 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
+use tokio::sync::Notify;
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    Service, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::config::Config;
+use crate::logging;
 
 const SERVICE_NAME: &str = "autospot";
 const SERVICE_DISPLAY_NAME: &str = "Autospot Wi-Fi Watchdog";
@@ -29,6 +30,13 @@ const SERVICE_DESCRIPTION: &str =
 
 const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+/// How long to wait for a stop to take effect before giving up on it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the Service Control Manager should allow our state changes to take.
+const STATUS_WAIT_HINT: Duration = Duration::from_secs(10);
 
 /// Register autospot as an auto-start Windows service running as LocalSystem, using
 /// `config_path` as the config it will load every time it starts, then start it.
@@ -39,9 +47,7 @@ pub fn install(config_path: &Path) -> Result<()> {
         .with_context(|| format!("resolving config path {}", config_path.display()))?;
     let exe_path = std::env::current_exe().context("locating the autospot executable")?;
 
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-        .map_err(elevation_friendly_error)?;
-
+    let manager = connect(ServiceManagerAccess::CREATE_SERVICE)?;
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY_NAME),
@@ -61,13 +67,15 @@ pub fn install(config_path: &Path) -> Result<()> {
     };
 
     let service = manager
-        .create_service(&service_info, ServiceAccess::START | ServiceAccess::CHANGE_CONFIG)
+        .create_service(
+            &service_info,
+            ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
+        )
         .map_err(elevation_friendly_error)?;
+
     // Best-effort: a missing description shouldn't fail the install.
     let _ = service.set_description(SERVICE_DESCRIPTION);
-    service
-        .start(&[] as &[&OsStr])
-        .context("starting the autospot service")?;
+    start(&service)?;
 
     println!("autospot service installed and started.");
     Ok(())
@@ -78,25 +86,13 @@ pub fn install(config_path: &Path) -> Result<()> {
 pub fn remove() -> Result<()> {
     require_elevation("removing")?;
 
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(elevation_friendly_error)?;
-
-    let service = match manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-    ) {
-        Ok(service) => service,
-        Err(e) if is_service_missing(&e) => {
-            println!("autospot service is not installed; nothing to remove.");
-            return Ok(());
-        }
-        Err(e) => return Err(elevation_friendly_error(e)),
+    let access = ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS;
+    let Some(service) = open(access)? else {
+        println!("autospot service is not installed; nothing to remove.");
+        return Ok(());
     };
 
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        service.stop().context("stopping the autospot service")?;
-        wait_for_stopped(&service)?;
-    }
+    stop(&service)?;
     service
         .delete()
         .context("deleting the autospot service registration")?;
@@ -112,58 +108,26 @@ pub fn remove() -> Result<()> {
 pub fn restart() -> Result<()> {
     require_elevation("restarting")?;
 
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(elevation_friendly_error)?;
-
-    let service = match manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
-    ) {
-        Ok(service) => service,
-        Err(e) if is_service_missing(&e) => anyhow::bail!(
-            "autospot service is not installed; use `autospot service install` first"
-        ),
-        Err(e) => return Err(elevation_friendly_error(e)),
+    let access = ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS;
+    let Some(service) = open(access)? else {
+        bail!("autospot service is not installed; use `autospot service install` first");
     };
 
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        service.stop().context("stopping the autospot service")?;
-        wait_for_stopped(&service)?;
-    }
-    service
-        .start(&[] as &[&OsStr])
-        .context("starting the autospot service")?;
+    stop(&service)?;
+    start(&service)?;
 
     println!("autospot service restarted.");
     Ok(())
 }
 
-fn wait_for_stopped(service: &windows_service::service::Service) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if service.query_status()?.current_state == ServiceState::Stopped {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    anyhow::bail!("timed out waiting for the autospot service to stop")
-}
-
 /// Print whether the service is installed and, if so, its current state.
 pub fn print_status() -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        Ok(service) => {
-            let status = service.query_status()?;
-            println!(
-                "autospot service: installed, state = {:?}",
-                status.current_state
-            );
-        }
-        Err(e) if is_service_missing(&e) => {
-            println!("autospot service: not installed");
-        }
-        Err(e) => return Err(e.into()),
+    match open(ServiceAccess::QUERY_STATUS)? {
+        Some(service) => println!(
+            "autospot service: installed, state = {:?}",
+            service.query_status()?.current_state
+        ),
+        None => println!("autospot service: not installed"),
     }
     Ok(())
 }
@@ -173,23 +137,50 @@ pub fn print_status() -> Result<()> {
 /// unelevated `autospot run`, and must behave correctly on a machine where the service
 /// was never installed.
 pub fn is_running() -> Result<bool> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        Ok(service) => Ok(service.query_status()?.current_state == ServiceState::Running),
-        Err(e) if is_service_missing(&e) => Ok(false),
-        Err(e) => Err(e.into()),
+    match open(ServiceAccess::QUERY_STATUS)? {
+        Some(service) => Ok(service.query_status()?.current_state == ServiceState::Running),
+        None => Ok(false),
     }
 }
 
-/// Base directory for log files in service mode: `%ProgramData%\autospot\logs`, a
-/// machine-wide location writable by LocalSystem and easy to find regardless of which
-/// account the service runs as. Falls back to the current directory if `ProgramData`
-/// isn't set, rather than failing outright.
-fn program_data_log_dir() -> PathBuf {
-    match std::env::var_os("ProgramData") {
-        Some(program_data) => PathBuf::from(program_data).join("autospot").join("logs"),
-        None => PathBuf::from("."),
+fn connect(access: ServiceManagerAccess) -> Result<ServiceManager> {
+    ServiceManager::local_computer(None::<&str>, access).map_err(elevation_friendly_error)
+}
+
+/// Open the autospot service with `access`. `None` means it isn't installed, which every
+/// caller here treats as a normal state rather than a failure.
+fn open(access: ServiceAccess) -> Result<Option<Service>> {
+    let manager = connect(ServiceManagerAccess::CONNECT)?;
+    match manager.open_service(SERVICE_NAME, access) {
+        Ok(service) => Ok(Some(service)),
+        Err(e) if is_service_missing(&e) => Ok(None),
+        Err(e) => Err(elevation_friendly_error(e)),
     }
+}
+
+fn start(service: &Service) -> Result<()> {
+    service
+        .start(&[] as &[&OsStr])
+        .context("starting the autospot service")
+}
+
+/// Stop the service and wait for it to actually be stopped. Already being stopped is a
+/// no-op.
+fn stop(service: &Service) -> Result<()> {
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    service.stop().context("stopping the autospot service")?;
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        std::thread::sleep(STOP_POLL_INTERVAL);
+    }
+
+    bail!("timed out waiting for the autospot service to stop")
 }
 
 fn is_service_missing(e: &windows_service::Error) -> bool {
@@ -200,7 +191,7 @@ fn is_service_missing(e: &windows_service::Error) -> bool {
 fn require_elevation(action: &str) -> Result<()> {
     let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool();
     if !elevated {
-        anyhow::bail!(
+        bail!(
             "{action} the autospot service requires Administrator privileges; re-run this \
              command from an elevated (\"Run as administrator\") terminal."
         );
@@ -214,7 +205,7 @@ fn elevation_friendly_error(e: windows_service::Error) -> anyhow::Error {
     if let windows_service::Error::Winapi(ref io_err) = e
         && io_err.raw_os_error() == Some(ERROR_ACCESS_DENIED)
     {
-        return anyhow::anyhow!(
+        return anyhow!(
             "access denied -- installing or removing the autospot service requires \
              Administrator privileges. Re-run this command from an elevated terminal."
         );
@@ -236,7 +227,7 @@ static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 pub fn run_dispatcher(config_path: PathBuf) -> Result<()> {
     CONFIG_PATH
         .set(config_path)
-        .map_err(|_| anyhow::anyhow!("run_dispatcher called more than once"))?;
+        .map_err(|_| anyhow!("run_dispatcher called more than once"))?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         .context("starting the service control dispatcher (is this really running as a service?)")
 }
@@ -254,45 +245,48 @@ fn service_main() -> Result<()> {
         .expect("run_dispatcher sets this before the dispatcher starts")
         .clone();
     let cfg = Config::load(&config_path)?;
-    let _guard = crate::init_file_logging(&cfg, &program_data_log_dir(), false)?;
+    let _guard = logging::init(&cfg, logging::Mode::Service)?;
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let handler_stop_flag = Arc::clone(&stop_flag);
+    let stop = Arc::new(Notify::new());
+    let handler_stop = Arc::clone(&stop);
 
-    let status_handle = service_control_handler::register(SERVICE_NAME, move |control| match control
-    {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            handler_stop_flag.store(true, Ordering::Relaxed);
-            ServiceControlHandlerResult::NoError
-        }
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        _ => ServiceControlHandlerResult::NotImplemented,
-    })
-    .context("registering the service control handler")?;
+    let status_handle =
+        service_control_handler::register(SERVICE_NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                handler_stop.notify_one();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })
+        .context("registering the service control handler")?;
 
-    let set_status = |state: ServiceState, controls_accepted: ServiceControlAccept| {
+    let report = |state: ServiceState, controls_accepted: ServiceControlAccept| {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted,
             exit_code: ServiceExitCode::NO_ERROR,
             checkpoint: 0,
-            wait_hint: Duration::from_secs(10),
+            wait_hint: STATUS_WAIT_HINT,
             process_id: None,
         })
     };
 
-    set_status(
+    report(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
     )?;
     tracing::info!("autospot service started");
 
-    let result = crate::monitor::run(&cfg, &config_path, &stop_flag);
+    // This runs on the SCM dispatcher's own thread, reached through a fixed FFI signature
+    // that can't itself be async, so it drives its own runtime rather than sharing one
+    // with the rest of the process.
+    let result = crate::block_on(crate::watchdog::run(&cfg, &config_path, &stop));
     if let Err(ref e) = result {
         tracing::error!("autospot service watchdog loop exited with an error: {e:#}");
     }
 
-    set_status(ServiceState::Stopped, ServiceControlAccept::empty())?;
+    report(ServiceState::Stopped, ServiceControlAccept::empty())?;
     result
 }

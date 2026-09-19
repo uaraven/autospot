@@ -1,14 +1,14 @@
 //! Wi-Fi connection status via the Win32 native Wi-Fi API (`wlanapi.dll`).
 
-use anyhow::{bail, Result};
-use windows::core::GUID;
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WiFi::{
-    dot11_radio_state_on, wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state,
-    wlan_interface_state_connected, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
-    WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO,
-    WLAN_INTERFACE_INFO_LIST, WLAN_RADIO_STATE,
+    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE,
+    WLAN_RADIO_STATE, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle,
+    WlanQueryInterface, dot11_radio_state_on, wlan_interface_state_connected,
+    wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state,
 };
+use windows::core::GUID;
 
 /// What a single Wi-Fi adapter is currently doing.
 #[derive(Debug, Clone)]
@@ -134,80 +134,63 @@ fn read_interface(handle: HANDLE, info: &WLAN_INTERFACE_INFO) -> InterfaceStatus
     }
 }
 
-/// Query `wlan_intf_opcode_current_connection` for the associated SSID.
+/// Query one interface attribute, handing the buffer Windows allocates to `read`. `None`
+/// when the query fails; the buffer is released either way.
 ///
-/// Best effort: a failure here only costs us a nicer log line, so it is not fatal.
-fn current_ssid(handle: HANDLE, guid: &GUID) -> Option<String> {
+/// # Safety
+///
+/// `T` must be the struct Windows documents for `opcode` -- `WlanQueryInterface` hands
+/// back an untyped buffer, so nothing else checks this.
+unsafe fn query_interface<T, R>(
+    handle: HANDLE,
+    guid: &GUID,
+    opcode: WLAN_INTF_OPCODE,
+    read: impl FnOnce(&T) -> R,
+) -> Option<R> {
     let mut size = 0u32;
     let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
 
-    let rc = unsafe {
-        WlanQueryInterface(
-            handle,
-            guid,
-            wlan_intf_opcode_current_connection,
-            None,
-            &mut size,
-            &mut data,
-            None,
-        )
-    };
+    let rc = unsafe { WlanQueryInterface(handle, guid, opcode, None, &mut size, &mut data, None) };
     if rc != ERROR_SUCCESS.0 || data.is_null() {
         return None;
     }
 
-    // SAFETY: on success the call yields a WLAN_CONNECTION_ATTRIBUTES buffer that we
-    // own and must release with WlanFreeMemory.
-    unsafe {
-        let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
-        let ssid = &attrs.wlanAssociationAttributes.dot11Ssid;
-        let len = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
-        let name = String::from_utf8_lossy(&ssid.ucSSID[..len]).into_owned();
-        WlanFreeMemory(data as *const _);
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        }
-    }
+    // SAFETY: on success the call yields a buffer of the opcode's type that we own and
+    // must release with WlanFreeMemory.
+    let value = read(unsafe { &*(data as *const T) });
+    unsafe { WlanFreeMemory(data as *const _) };
+    Some(value)
 }
 
-/// Query `wlan_intf_opcode_radio_state` for whether the adapter's software radio is on.
+/// The SSID the adapter is associated with.
+///
+/// Best effort: a failure here only costs us a nicer log line, so it is not fatal.
+fn current_ssid(handle: HANDLE, guid: &GUID) -> Option<String> {
+    let read = |attrs: &WLAN_CONNECTION_ATTRIBUTES| {
+        let ssid = &attrs.wlanAssociationAttributes.dot11Ssid;
+        let len = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
+        String::from_utf8_lossy(&ssid.ucSSID[..len]).into_owned()
+    };
+    let name = unsafe { query_interface(handle, guid, wlan_intf_opcode_current_connection, read) }?;
+
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether the adapter's software radio is on.
 ///
 /// Best effort: like `current_ssid`, a query failure only costs a less precise status --
 /// but unlike `current_ssid` this feeds a real decision (whether to attempt a hotspot
 /// start), so failures default to `true` rather than `false` to avoid ever blocking a
 /// legitimate start on a read we couldn't perform.
 fn radio_enabled(handle: HANDLE, guid: &GUID) -> bool {
-    let mut size = 0u32;
-    let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
-
-    let rc = unsafe {
-        WlanQueryInterface(
-            handle,
-            guid,
-            wlan_intf_opcode_radio_state,
-            None,
-            &mut size,
-            &mut data,
-            None,
-        )
-    };
-    if rc != ERROR_SUCCESS.0 || data.is_null() {
-        return true;
-    }
-
-    // SAFETY: on success the call yields a fixed-size WLAN_RADIO_STATE buffer that we
-    // own and must release with WlanFreeMemory.
-    unsafe {
-        let state = &*(data as *const WLAN_RADIO_STATE);
+    let read = |state: &WLAN_RADIO_STATE| {
         let count = (state.dwNumberOfPhys as usize).min(state.PhyRadioState.len());
-        let enabled = state.PhyRadioState[..count]
+        state.PhyRadioState[..count]
             .iter()
-            .any(|phy| phy.dot11SoftwareRadioState == dot11_radio_state_on);
-        WlanFreeMemory(data as *const _);
-        enabled
-    }
+            .any(|phy| phy.dot11SoftwareRadioState == dot11_radio_state_on)
+    };
+
+    unsafe { query_interface(handle, guid, wlan_intf_opcode_radio_state, read) }.unwrap_or(true)
 }
 
 /// Convert a fixed-size, NUL-padded UTF-16 buffer into a `String`.
@@ -256,10 +239,16 @@ mod tests {
     #[test]
     fn a_real_network_still_counts_while_the_hotspot_runs() {
         let status = WifiStatus {
-            interfaces: vec![iface(true, Some("MyFallbackHotspot")), iface(true, Some("home"))],
+            interfaces: vec![
+                iface(true, Some("MyFallbackHotspot")),
+                iface(true, Some("home")),
+            ],
         };
         assert!(status.is_connected(Some("MyFallbackHotspot")));
-        assert_eq!(status.connected_ssid(Some("MyFallbackHotspot")), Some("home"));
+        assert_eq!(
+            status.connected_ssid(Some("MyFallbackHotspot")),
+            Some("home")
+        );
     }
 
     #[test]

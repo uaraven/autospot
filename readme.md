@@ -12,11 +12,13 @@ Autospot starts on Windows startup and continuously monitors the connection. If 
 
 Download the latest version from the [releases](https://github.com/uaraven/autospot/releases), unzip it, adjust the configuration to your needs, and run the program.
 
+This program requires Windows 11.
+
 There are two ways to run Autospot: as a Windows service or as a simple application.
 
 ### Running as an application
 
-This method is recommended if you use automatic login in Windows. This starts Autospot in your own login session, so it only runs once you've logged in. If you need the hotspot available before login (e.g. when connecting to a machine in the field), install Autospot as a Windows service instead – see below.
+This method is recommended if you use automatic login in Windows. It starts Autospot in your own login session, so it only runs once you've logged in. If you need the hotspot available before login (e.g. when connecting to a machine in the field), install Autospot as a Windows service instead -- see below.
 
 To enable automatic start after user login:
 
@@ -29,8 +31,7 @@ Autospot prints status messages to the console window it runs in, and also write
 
 ### Running as a Windows service
 
-Autospot can run as a Windows service instead of a console app, so it starts before any
-user logs in. From an elevated ("Run as administrator") command prompt or PowerShell:
+Autospot can run as a Windows service instead of a console app, so it starts before any user logs in. From an elevated ("Run as administrator") command prompt or PowerShell:
 
 ```
 autospot.exe service install
@@ -58,12 +59,7 @@ To make the service pick up configuration changes, restart it instead:
 autospot.exe service restart
 ```
 
-The service logs to `%ProgramData%\autospot\logs\`, at the level set by
-`logging.service_level` in `autospot.toml` (defaults to `info`, since service mode has
-no console for routine status lines to appear in). While the service is running, plain
-`autospot.exe` (with no service commands) will print a warning and exit instead of
-starting a second watchdog -- stop or remove the service first if you want to run it as
-a console app again.
+The service logs to `%ProgramData%\autospot\logs\`, at the level set by `logging.service_level` in `autospot.toml` (defaults to `info`, since service mode has no console for routine status lines to appear in). While the service is running, plain `autospot.exe` (with no service commands) will print a warning and exit instead of starting a second watchdog -- stop or remove the service first if you want to run it as a console app again.
 
 ## Configuration
 
@@ -74,6 +70,23 @@ There is an `autospot.toml` configuration file distributed alongside `autospot.e
 The companion device is a DIY USB dongle with a microcontroller and a display. It simplifies the astrophotographer's life (already complicated enough without all this IT shit) by showing the NINA computer's current connection status, its IP address for remote desktop connections, and the hotspot's SSID and password when the hotspot is enabled.
 
 See the [companion's readme](companion/readme.md) for details.
+
+## Windows 10 compatibility
+
+Windows 10 does not support creating a hotspot without an active internet connection, so if you're out in the field with no internet, your PC won't create a hotspot you can connect to.
+
+Windows 10 reached end of life on October 14, 2025, so you probably should not use it.
+
+Note that Windows 10 is officially not supported by Autospot, and all tickets opened for Windows 10 will be closed without response.
+
+If you have no other choice, though, open "Device Manager", choose the "Action->Add legacy hardware" menu item, click Next, and choose the "Install the hardware that I manually select from a list" option, then click Next again. From the list of hardware types select "Network adapters", click Next, select "Microsoft" in the list of manufacturers and "Microsoft KM-TEST Loopback Adapter" in the list of models. Click Next to install the driver.
+
+There should be "Microsoft KM-TEST Loopback Adapter" in the list of Network adapters in the Device Manager. You should now be able to create a hotspot.
+
+## Support
+
+For support, open an issue on [GitHub](https://github.com/uaraven/autospot/issues) and choose "bug" or "request" as the label.
+
 
 ## License
 

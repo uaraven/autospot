@@ -1,322 +1,458 @@
-//! The decision logic: when should the hotspot go on, and when should it go off?
-//!
-//! This module is pure -- it takes the current time and a Wi-Fi boolean and returns an
-//! intent. All Windows calls live in `main`, which is what makes the rules testable and
-//! keeps the happy path (Wi-Fi is fine) from touching WinRT at all.
+//! The watchdog loop: polls Wi-Fi state every tick, drives the hotspot on and off in
+//! response, and prints the console status line and optional companion status update.
 
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Instant;
 
-/// What the caller should do about the current tick.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Intent {
-    /// Nothing to do.
-    Idle,
-    /// Wi-Fi just dropped; the countdown starts now.
-    WifiLost,
-    /// Wi-Fi is down but the threshold has not elapsed yet.
-    Waiting { down_for: Duration, remaining: Duration },
-    /// Wi-Fi has been down long enough: bring the hotspot up if it is not already.
-    StartHotspot { down_for: Duration },
-    /// A previous start attempt failed; holding off before trying again.
-    HoldingForRetry { retry_in: Duration },
-    /// Wi-Fi came back.
-    WifiRestored {
-        down_for: Duration,
-        /// True when we started the hotspot and are configured to turn it back off.
-        stop_hotspot: bool,
-    },
+use anyhow::{Result, bail};
+use tokio::sync::Notify;
+use tracing::{debug, error, info, warn};
+
+use crate::adapters::{self, Adapter};
+use crate::companion::CompanionSession;
+use crate::config::Config;
+use crate::hotspot::{Hotspot, State};
+use crate::policy::{Intent, OnReconnect, Policy};
+use crate::status::{self, Status};
+use crate::wifi;
+
+/// The watchdog loop. Runs until `stop` is notified; pass a `Notify` that's never
+/// notified to run forever, as the console `run` command does.
+pub async fn run(cfg: &Config, config_path: &Path, stop: &Notify) -> Result<()> {
+    Watchdog::new(cfg).run(config_path, stop).await
 }
 
-pub struct Watchdog {
-    threshold: Duration,
-    auto_disable_on_reconnect: bool,
-    retry_backoff: Duration,
-    /// When the current run of disconnection began; `None` while Wi-Fi is up.
-    disconnected_since: Option<Instant>,
-    /// Only hotspots this process switched on are switched back off automatically.
-    started_by_us: bool,
-    /// Set after a failed start so we do not retry on every poll.
-    retry_after: Option<Instant>,
+/// The watchdog loop's persistent state, carried across ticks.
+struct Watchdog<'a> {
+    cfg: &'a Config,
+    /// Our own hotspot's SSID, which never counts as Wi-Fi being back -- see
+    /// [`wifi::WifiStatus::active_interface`].
+    ignore_ssid: Option<&'a str>,
+    policy: Policy,
+    companion: CompanionSession,
 }
 
-impl Watchdog {
-    pub fn new(threshold: Duration, auto_disable_on_reconnect: bool) -> Self {
-        Self::with_backoff(
-            threshold,
-            auto_disable_on_reconnect,
-            Duration::from_secs(60),
-        )
-    }
+impl<'a> Watchdog<'a> {
+    fn new(cfg: &'a Config) -> Self {
+        let on_reconnect = if cfg.monitor.auto_disable_on_reconnect {
+            OnReconnect::StopHotspot
+        } else {
+            OnReconnect::LeaveHotspotOn
+        };
 
-    pub fn with_backoff(
-        threshold: Duration,
-        auto_disable_on_reconnect: bool,
-        retry_backoff: Duration,
-    ) -> Self {
         Self {
-            threshold,
-            auto_disable_on_reconnect,
-            retry_backoff,
-            disconnected_since: None,
-            started_by_us: false,
-            retry_after: None,
+            cfg,
+            ignore_ssid: Some(cfg.hotspot.ssid.as_str()),
+            policy: Policy::new(cfg.monitor.disconnect_threshold(), on_reconnect),
+            companion: CompanionSession::new(cfg.companion),
         }
     }
 
-    /// Feed one poll result in and get back what to do.
-    pub fn evaluate(&mut self, now: Instant, wifi_connected: bool) -> Intent {
-        if wifi_connected {
-            return match self.disconnected_since.take() {
-                Some(since) => {
-                    self.retry_after = None;
-                    Intent::WifiRestored {
-                        down_for: now.saturating_duration_since(since),
-                        stop_hotspot: self.started_by_us && self.auto_disable_on_reconnect,
-                    }
-                }
-                None => Intent::Idle,
-            };
+    async fn run(&mut self, config_path: &Path, stop: &Notify) -> Result<()> {
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            config = %config_path.display(),
+            ssid = %self.cfg.hotspot.ssid,
+            uplink = %self.cfg.hotspot.uplink_adapter,
+            poll_interval_secs = self.cfg.monitor.poll_interval_secs,
+            disconnect_threshold_secs = self.cfg.monitor.disconnect_threshold_secs,
+            auto_disable_on_reconnect = self.cfg.monitor.auto_disable_on_reconnect,
+            "autospot starting"
+        );
+
+        loop {
+            self.tick(Instant::now()).await;
+
+            // Wait out the poll interval, unless we are asked to stop first.
+            tokio::select! {
+                _ = tokio::time::sleep(self.cfg.monitor.poll_interval()) => {}
+                _ = stop.notified() => break,
+            }
         }
 
-        let since = match self.disconnected_since {
-            Some(since) => since,
-            None => {
-                self.disconnected_since = Some(now);
-                return Intent::WifiLost;
+        info!("autospot stopping");
+        Ok(())
+    }
+
+    /// One poll: read where things stand, report it, and act on it.
+    async fn tick(&mut self, now: Instant) {
+        let (wifi_ok, status) = match wifi::query() {
+            Ok(status) => (true, status),
+            // Treat an unreadable Wi-Fi stack as "state unknown": still worth a companion
+            // status update (status="unknown"), but not worth feeding a guess into the
+            // policy.
+            Err(e) => {
+                warn!("could not read Wi-Fi state: {e:#}");
+                (false, wifi::WifiStatus::default())
             }
         };
 
-        let down_for = now.saturating_duration_since(since);
-        if down_for < self.threshold {
-            return Intent::Waiting {
-                down_for,
-                remaining: self.threshold - down_for,
-            };
+        // Best-effort snapshots shared by the console status line and the companion
+        // status update; a failure here (e.g. a transient IP Helper hiccup) should never
+        // stop the loop.
+        let adapters = adapters::list().unwrap_or_default();
+        let live_hotspot = query_hotspot(self.cfg);
+
+        if self.cfg.companion.enabled {
+            let report = self.companion_status(wifi_ok, &status, &adapters, live_hotspot.as_ref());
+            self.companion.report(now, report);
         }
 
-        if let Some(retry_after) = self.retry_after {
-            if now < retry_after {
-                return Intent::HoldingForRetry {
-                    retry_in: retry_after.saturating_duration_since(now),
-                };
+        if !wifi_ok {
+            return;
+        }
+
+        let intent = self
+            .policy
+            .evaluate(now, status.is_connected(self.ignore_ssid));
+
+        info!(
+            "{} | Hotspot: {}",
+            wifi_status_text(&status, &adapters, self.ignore_ssid, &intent),
+            hotspot_summary_text(live_hotspot.as_ref(), &adapters)
+        );
+
+        self.handle_intent(now, &status, intent).await;
+    }
+
+    /// React to what the policy decided this tick: log it, and bring the hotspot up or
+    /// down if that's what the intent calls for.
+    async fn handle_intent(&mut self, now: Instant, status: &wifi::WifiStatus, intent: Intent) {
+        match intent {
+            Intent::Idle | Intent::Waiting { .. } | Intent::HoldingForRetry { .. } => {}
+            Intent::WifiLost => {
+                info!(
+                    threshold_secs = self.cfg.monitor.disconnect_threshold_secs,
+                    "Wi-Fi disconnected; starting countdown"
+                );
+            }
+            Intent::StartHotspot { down_for } => {
+                info!(
+                    down_for_secs = down_for.as_secs(),
+                    "Wi-Fi has been down past the threshold; bringing the hotspot up"
+                );
+                if let Err(e) = self.try_start(status).await {
+                    error!("could not start the hotspot: {e:#}");
+                    self.policy.record_start_failure(now);
+                }
+            }
+            Intent::WifiRestored {
+                down_for,
+                stop_hotspot,
+            } => {
+                info!(
+                    down_for_secs = down_for.as_secs(),
+                    ssid = ?status.connected_ssid(self.ignore_ssid),
+                    "Wi-Fi reconnected"
+                );
+                // Keep ownership on failure so the next reconnect tick tries again.
+                if stop_hotspot && let Err(e) = self.try_stop().await {
+                    error!("could not stop the hotspot: {e:#}");
+                }
             }
         }
-
-        Intent::StartHotspot { down_for }
     }
 
-    /// Record that the hotspot is up because of us.
-    pub fn record_started(&mut self) {
-        self.started_by_us = true;
-        self.retry_after = None;
+    /// Bring the hotspot up, unless it is already up or mid-transition.
+    async fn try_start(&mut self, wifi_status: &wifi::WifiStatus) -> Result<()> {
+        if !wifi_status.radio_enabled() {
+            bail!(
+                "Wi-Fi is turned off; not starting the hotspot (Mobile Hotspot needs the \
+                 Wi-Fi radio on to broadcast)"
+            );
+        }
+
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
+
+        match hotspot.state()? {
+            State::On => {
+                // Only worth mentioning if it's broadcasting an SSID we didn't configure
+                // -- if it matches ours, this is just our own hotspot, started on an
+                // earlier tick, still running. Somebody else's stays under manual
+                // control, including on reconnect.
+                let is_ours = hotspot
+                    .current_ssid()
+                    .is_ok_and(|ssid| ssid == self.cfg.hotspot.ssid);
+                if !is_ours {
+                    info!(
+                        uplink = %hotspot.uplink_profile,
+                        "hotspot is already on with a different configuration; leaving it under manual control"
+                    );
+                }
+                Ok(())
+            }
+            State::InTransition => {
+                debug!("hotspot is mid-transition; waiting for it to settle");
+                Ok(())
+            }
+            State::Off | State::Unknown => {
+                hotspot.start(&self.cfg.hotspot).await?;
+                self.policy.record_started();
+                Ok(())
+            }
+        }
     }
 
-    /// Record that the hotspot is no longer our responsibility.
-    pub fn record_stopped(&mut self) {
-        self.started_by_us = false;
+    /// Take the hotspot back down after Wi-Fi returns.
+    async fn try_stop(&mut self) -> Result<()> {
+        let hotspot = Hotspot::for_uplink(&self.cfg.hotspot)?;
+
+        match hotspot.state()? {
+            State::Off => {
+                debug!("hotspot is already off");
+                self.policy.record_stopped();
+                Ok(())
+            }
+            State::InTransition => {
+                debug!("hotspot is mid-transition; will stop it on the next poll");
+                Ok(())
+            }
+            State::On | State::Unknown => {
+                hotspot.stop().await?;
+                self.policy.record_stopped();
+                Ok(())
+            }
+        }
     }
 
-    /// Record a failed start so the next attempt waits out the backoff.
-    pub fn record_start_failure(&mut self, now: Instant) {
-        self.retry_after = Some(now + self.retry_backoff);
-    }
+    /// Build this tick's status for the companion, from the wifi/adapter/hotspot
+    /// snapshots already gathered for the console status line.
+    fn companion_status(
+        &self,
+        wifi_ok: bool,
+        status: &wifi::WifiStatus,
+        adapters: &[Adapter],
+        live_hotspot: Option<&LiveHotspot>,
+    ) -> Status {
+        let active = status.active_interface(self.ignore_ssid);
+        let wifi = status::WifiSnapshot {
+            wifi_ok,
+            radio_enabled: status.radio_enabled(),
+            connected: active.is_some(),
+            ssid: active.and_then(|iface| iface.ssid.as_deref()),
+            ip_address: active.and_then(|iface| adapters::ipv4_of(adapters, &iface.description)),
+        };
+        let hotspot = live_hotspot.map(|h| status::HotspotSnapshot {
+            on: h.state == State::On,
+            ssid: &self.cfg.hotspot.ssid,
+            password: &self.cfg.hotspot.passphrase,
+            ip_address: adapters::hotspot_ip(adapters),
+        });
 
+        Status::new(&wifi, hotspot.as_ref())
+    }
+}
+
+/// Live hotspot state, queried once per tick and shared by the console status line and
+/// the companion status update so neither reads Windows twice.
+struct LiveHotspot {
+    state: State,
+    ssid: String,
+    clients: u32,
+}
+
+/// Best-effort live hotspot query. `None` collapses to "off" everywhere it is used,
+/// since the most common cause -- the uplink has no connection profile right now -- is
+/// routine, not worth alarming over every few seconds.
+fn query_hotspot(cfg: &Config) -> Option<LiveHotspot> {
+    let hotspot = Hotspot::for_uplink(&cfg.hotspot)
+        .inspect_err(|e| debug!("hotspot status unavailable: {e:#}"))
+        .ok()?;
+    let state = hotspot
+        .state()
+        .inspect_err(|e| debug!("could not read hotspot state: {e:#}"))
+        .ok()?;
+
+    Some(LiveHotspot {
+        state,
+        ssid: hotspot
+            .current_ssid()
+            .unwrap_or_else(|_| cfg.hotspot.ssid.clone()),
+        clients: hotspot.client_count().unwrap_or(0),
+    })
+}
+
+/// The Wi-Fi half of the status line: connection, IP, and (while waiting) a countdown.
+/// Kept free of any Windows call of its own so it can be unit tested directly.
+fn wifi_status_text(
+    status: &wifi::WifiStatus,
+    adapters: &[Adapter],
+    ignore_ssid: Option<&str>,
+    intent: &Intent,
+) -> String {
+    let wifi = match status.active_interface(ignore_ssid) {
+        Some(iface) => format!(
+            "Wi-Fi: connected to '{}' ({})",
+            iface.ssid.as_deref().unwrap_or("?"),
+            adapters::ipv4_of(adapters, &iface.description).unwrap_or("no IP yet"),
+        ),
+        None => "Wi-Fi: disconnected".to_string(),
+    };
+
+    let countdown = match intent {
+        Intent::Waiting { remaining } => format!(" (hotspot in {}s)", remaining.as_secs()),
+        Intent::HoldingForRetry { retry_in } => {
+            format!(" (retrying hotspot start in {}s)", retry_in.as_secs())
+        }
+        _ => String::new(),
+    };
+
+    format!("{wifi}{countdown}")
+}
+
+/// The hotspot half of the status line. Pure, so it is unit tested directly.
+fn hotspot_summary_text(live: Option<&LiveHotspot>, adapters: &[Adapter]) -> String {
+    let Some(hotspot) = live else {
+        return "off".to_string();
+    };
+
+    match hotspot.state {
+        State::On => match adapters::hotspot_ip(adapters) {
+            Some(ip) => format!(
+                "on (ssid='{}', ip={ip}, clients={})",
+                hotspot.ssid, hotspot.clients
+            ),
+            None => format!("on (ssid='{}', clients={})", hotspot.ssid, hotspot.clients),
+        },
+        State::InTransition => "starting/stopping".to_string(),
+        State::Off => "off".to_string(),
+        State::Unknown => "unknown".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    const THRESHOLD: Duration = Duration::from_secs(120);
+    fn test_config() -> Config {
+        Config::from_toml(
+            r#"
+[hotspot]
+ssid = "Fallback"
+passphrase = "password1"
+uplink_adapter = "Ethernet"
+"#,
+        )
+        .unwrap()
+    }
 
-    fn watchdog() -> (Watchdog, Instant) {
-        (Watchdog::new(THRESHOLD, true), Instant::now())
+    #[tokio::test]
+    async fn run_returns_immediately_when_already_told_to_stop() {
+        let cfg = test_config();
+        let stop = Notify::new();
+        stop.notify_one();
+        let path = Path::new("autospot.toml");
+        assert!(run(&cfg, path, &stop).await.is_ok());
+    }
+
+    fn connected_status(description: &str, ssid: &str) -> wifi::WifiStatus {
+        wifi::WifiStatus {
+            interfaces: vec![wifi::InterfaceStatus {
+                description: description.into(),
+                connected: true,
+                ssid: Some(ssid.into()),
+                radio_enabled: true,
+            }],
+        }
+    }
+
+    fn disconnected_status() -> wifi::WifiStatus {
+        wifi::WifiStatus { interfaces: vec![] }
     }
 
     #[test]
-    fn stays_idle_while_wifi_is_up() {
-        let (mut w, t0) = watchdog();
-        assert_eq!(w.evaluate(t0, true), Intent::Idle);
-        assert_eq!(w.evaluate(t0 + Duration::from_secs(300), true), Intent::Idle);
-    }
-
-    #[test]
-    fn reports_the_first_tick_of_a_disconnection() {
-        let (mut w, t0) = watchdog();
-        assert_eq!(w.evaluate(t0, false), Intent::WifiLost);
-    }
-
-    #[test]
-    fn waits_out_the_full_threshold_before_starting() {
-        let (mut w, t0) = watchdog();
-        w.evaluate(t0, false);
-
+    fn wifi_status_text_shows_ssid_and_ip_when_connected() {
+        let status = connected_status("Intel(R) Wireless-AC 7260", "banderstadt");
+        let adapters = [Adapter::test(1)
+            .named("Wi-Fi", "Intel(R) Wireless-AC 7260")
+            .with_ipv4(&["192.168.10.218"])];
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(5), false),
-            Intent::Waiting {
-                down_for: Duration::from_secs(5),
-                remaining: Duration::from_secs(115),
-            }
+            wifi_status_text(&status, &adapters, None, &Intent::Idle),
+            "Wi-Fi: connected to 'banderstadt' (192.168.10.218)"
         );
-        assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(119), false),
-            Intent::Waiting { .. }
-        ));
+    }
+
+    #[test]
+    fn wifi_status_text_flags_a_missing_ip_rather_than_hiding_it() {
+        let status = connected_status("Intel(R) Wireless-AC 7260", "banderstadt");
         assert_eq!(
-            w.evaluate(t0 + THRESHOLD, false),
+            wifi_status_text(&status, &[], None, &Intent::Idle),
+            "Wi-Fi: connected to 'banderstadt' (no IP yet)"
+        );
+    }
+
+    #[test]
+    fn wifi_status_text_reports_disconnected() {
+        assert_eq!(
+            wifi_status_text(&disconnected_status(), &[], None, &Intent::WifiLost),
+            "Wi-Fi: disconnected"
+        );
+    }
+
+    #[test]
+    fn wifi_status_text_appends_a_countdown_while_waiting() {
+        let intent = Intent::Waiting {
+            remaining: Duration::from_secs(75),
+        };
+        assert_eq!(
+            wifi_status_text(&disconnected_status(), &[], None, &intent),
+            "Wi-Fi: disconnected (hotspot in 75s)"
+        );
+    }
+
+    #[test]
+    fn wifi_status_text_appends_a_retry_countdown() {
+        let intent = Intent::HoldingForRetry {
+            retry_in: Duration::from_secs(30),
+        };
+        assert_eq!(
+            wifi_status_text(&disconnected_status(), &[], None, &intent),
+            "Wi-Fi: disconnected (retrying hotspot start in 30s)"
+        );
+    }
+
+    #[test]
+    fn wifi_status_text_has_no_suffix_for_other_intents() {
+        for intent in [
+            Intent::Idle,
+            Intent::WifiLost,
             Intent::StartHotspot {
-                down_for: THRESHOLD
-            }
-        );
-    }
-
-    #[test]
-    fn a_brief_blip_resets_the_countdown() {
-        let (mut w, t0) = watchdog();
-        w.evaluate(t0, false);
-        w.evaluate(t0 + Duration::from_secs(60), false);
-
-        // Wi-Fi returns at t+70 before the threshold, so no hotspot was ever started.
-        assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(70), true),
+                down_for: Duration::from_secs(120),
+            },
             Intent::WifiRestored {
-                down_for: Duration::from_secs(70),
-                stop_hotspot: false,
-            }
-        );
-
-        // Dropping again starts a fresh 120s countdown rather than resuming the old one.
-        assert_eq!(w.evaluate(t0 + Duration::from_secs(75), false), Intent::WifiLost);
-        assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(180), false),
-            Intent::Waiting { .. }
-        ));
-        assert!(matches!(
-            w.evaluate(t0 + Duration::from_secs(195), false),
-            Intent::StartHotspot { .. }
-        ));
-    }
-
-    #[test]
-    fn asks_to_stop_only_a_hotspot_it_started() {
-        let (mut w, t0) = watchdog();
-        w.evaluate(t0, false);
-        w.evaluate(t0 + THRESHOLD, false);
-        w.record_started();
-
-        assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
-            Intent::WifiRestored {
-                down_for: Duration::from_secs(200),
+                down_for: Duration::from_secs(5),
                 stop_hotspot: true,
-            }
-        );
+            },
+        ] {
+            assert_eq!(
+                wifi_status_text(&disconnected_status(), &[], None, &intent),
+                "Wi-Fi: disconnected"
+            );
+        }
     }
 
     #[test]
-    fn leaves_a_manually_started_hotspot_alone() {
-        let (mut w, t0) = watchdog();
-        w.evaluate(t0, false);
-        // No record_started(): the hotspot was already on, not switched on by us.
+    fn hotspot_summary_reports_off_when_there_is_nothing_to_report() {
+        assert_eq!(hotspot_summary_text(None, &[]), "off");
+    }
+
+    #[test]
+    fn hotspot_summary_reports_ssid_ip_and_clients_when_on() {
+        let live = LiveHotspot {
+            state: State::On,
+            ssid: "Fallback".to_string(),
+            clients: 2,
+        };
+        let adapters = [Adapter::test(1).with_ipv4(&["192.168.137.1"])];
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
-            Intent::WifiRestored {
-                down_for: Duration::from_secs(200),
-                stop_hotspot: false,
-            }
+            hotspot_summary_text(Some(&live), &adapters),
+            "on (ssid='Fallback', ip=192.168.137.1, clients=2)"
         );
-    }
-
-    #[test]
-    fn honours_auto_disable_on_reconnect_being_off() {
-        let mut w = Watchdog::new(THRESHOLD, false);
-        let t0 = Instant::now();
-        w.evaluate(t0, false);
-        w.evaluate(t0 + THRESHOLD, false);
-        w.record_started();
-
+        // Without the ICS address there is no IP to show yet.
         assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(200), true),
-            Intent::WifiRestored {
-                down_for: Duration::from_secs(200),
-                stop_hotspot: false,
-            }
-        );
-    }
-
-    #[test]
-    fn backs_off_after_a_failed_start_instead_of_retrying_every_poll() {
-        let mut w = Watchdog::with_backoff(THRESHOLD, true, Duration::from_secs(60));
-        let t0 = Instant::now();
-        w.evaluate(t0, false);
-
-        let at_threshold = t0 + THRESHOLD;
-        assert!(matches!(
-            w.evaluate(at_threshold, false),
-            Intent::StartHotspot { .. }
-        ));
-        w.record_start_failure(at_threshold);
-
-        assert_eq!(
-            w.evaluate(at_threshold + Duration::from_secs(5), false),
-            Intent::HoldingForRetry {
-                retry_in: Duration::from_secs(55)
-            }
-        );
-        assert!(matches!(
-            w.evaluate(at_threshold + Duration::from_secs(60), false),
-            Intent::StartHotspot { .. }
-        ));
-    }
-
-    #[test]
-    fn a_reconnect_clears_a_pending_retry_backoff() {
-        let mut w = Watchdog::with_backoff(THRESHOLD, true, Duration::from_secs(600));
-        let t0 = Instant::now();
-        w.evaluate(t0, false);
-        let at_threshold = t0 + THRESHOLD;
-        w.evaluate(at_threshold, false);
-        w.record_start_failure(at_threshold);
-
-        w.evaluate(at_threshold + Duration::from_secs(10), true);
-
-        // Fresh outage: the old backoff must not delay the new attempt.
-        let t1 = at_threshold + Duration::from_secs(20);
-        w.evaluate(t1, false);
-        assert!(matches!(
-            w.evaluate(t1 + THRESHOLD, false),
-            Intent::StartHotspot { .. }
-        ));
-    }
-
-    #[test]
-    fn keeps_asking_to_start_until_told_it_succeeded() {
-        let (mut w, t0) = watchdog();
-        w.evaluate(t0, false);
-        assert!(matches!(
-            w.evaluate(t0 + THRESHOLD, false),
-            Intent::StartHotspot { .. }
-        ));
-        // No record_started(), e.g. the caller found the profile missing.
-        assert!(matches!(
-            w.evaluate(t0 + THRESHOLD + Duration::from_secs(5), false),
-            Intent::StartHotspot { .. }
-        ));
-    }
-
-    #[test]
-    fn record_stopped_releases_ownership() {
-        let (mut w, t0) = watchdog();
-        w.record_started();
-        w.record_stopped();
-
-        w.evaluate(t0, false);
-        assert_eq!(
-            w.evaluate(t0 + Duration::from_secs(10), true),
-            Intent::WifiRestored {
-                down_for: Duration::from_secs(10),
-                stop_hotspot: false,
-            }
+            hotspot_summary_text(Some(&live), &[]),
+            "on (ssid='Fallback', clients=2)"
         );
     }
 }
