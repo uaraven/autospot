@@ -27,6 +27,8 @@ To enable automatic start after user login:
 - Move the shortcut for autospot.exe into the Startup folder.
 - autospot.exe will start the next time you log in to Windows.
 
+Autospot is not signed, so Windows will ask for the confirmation before starting program. Uncheck the box "Ask every time".
+
 Autospot prints status messages to the console window it runs in, and also writes log files to the `Documents\autospot\logs` folder.
 
 ### Running as a Windows service
