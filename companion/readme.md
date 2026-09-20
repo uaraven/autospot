@@ -52,7 +52,7 @@ If autospot's logs shows "no companion device found", you might need to change t
 
 If you want to add support for a new microcontroller board follow these steps:
 
-- create a directory for your board in `hal` folder
+- create a directory for your board in `board` folder
 - create `lib` folder and copy any CircuitPython libraries that are needed by the board there
 - create `hal.py` file and implement the following functions:
   - initialize_display() - to initialize the display
