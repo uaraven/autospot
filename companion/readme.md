@@ -6,7 +6,7 @@ Autospot companion plugs into the computer running [autospot](https://github.com
 
 This repository contains the source code for the Autospot companion. This code runs on a CircuitPython-compatible microcontroller, connected to the host computer by USB and displaying the network connection information.
 
-![](companion.jpg)
+![](companion.png)
 
 ## Requirements
 
