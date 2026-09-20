@@ -44,6 +44,7 @@ If autospot's logs shows "no companion device found", you might need to change t
 | :-----------------------------------------------------------------------: | :------------------------------------------------------- | :------------------------------------------- |
 | [LilyGo T-Display RP2040](https://lilygo.cc/collections/t-display-series) | https://circuitpython.org/board/lilygo_t_display_rp2040/ | It looks like LilyGo discontinued this board |
 |    [Waveshare RP2350-Geek](https://www.waveshare.com/wiki/RP2350-GEEK)    | https://circuitpython.org/board/waveshare_rp2350_geek/   |                                              |
+| [LilyGo T-Dongle S3 (K193)](https://lilygo.cc/products/t-dongle-s3)| https://circuitpython.org/board/lilygo_tdongle_s3/ | Install CircuitPython using .bin file |
 
 ## Contributing
 
