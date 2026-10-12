@@ -47,7 +47,7 @@ while True:
                         status['time'] = payload
     if hal.read_button():
         status['status'] = "message"
-        status['message'] = 'Sending switch command'
+        status['message'] = 'Switching Hotspot'
         sys.stdout.write("S\n")
     hal.show_info(status)
     # Small delay to keep the system responsive

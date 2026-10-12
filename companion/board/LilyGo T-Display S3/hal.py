@@ -67,6 +67,8 @@ def show_info(items):
             _line(disc_bitmap, 'Disconnected', 50)
     elif items['status'] == "wifi-off":
         _line(disc_bitmap, "Wi-Fi: OFF", 50)
+    elif items['status'] == "message":
+        _line(nodata_bitmap, items['message'], 35)
     else:
         _line(nodata_bitmap, 'No data', 40)
         _add_line("Run autospot.exe", 75)
