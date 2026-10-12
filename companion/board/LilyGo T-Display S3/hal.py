@@ -4,8 +4,6 @@ import busio
 import fourwire
 import adafruit_st7789
 import terminalio
-import vectorio
-import supervisor
 from adafruit_display_text import label
 import keypad
 
