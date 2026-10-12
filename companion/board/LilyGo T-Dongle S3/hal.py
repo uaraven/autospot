@@ -2,11 +2,14 @@ import displayio
 import terminalio
 import supervisor
 from adafruit_display_text import label
-
+import digitalio
+import keypad
+import board
 
 SCALE = 1
 _main_group = None
 _display = None
+_toggle_button = None
 
 RED = 0xFF0000
 
@@ -59,6 +62,8 @@ def show_info(items):
             _ico_line(disc_bitmap, 'Disconnected', 35)
     elif items['status'] == "wifi-off":
         _ico_line(disc_bitmap, "Wi-Fi: OFF", 35)
+    elif items['status'] == "message":
+        _ico_line(nodata_bitmap, items['message'], 35)
     else:
         _ico_line(nodata_bitmap, 'No data', 25)
         _add_line("Run autospot.exe", 48)
@@ -66,7 +71,7 @@ def show_info(items):
 
 
 def initialize_display():
-    global _display, _main_group
+    global _display, _main_group, _toggle_button
     _display = supervisor.runtime.display
 
     _display.rotation=270
@@ -74,3 +79,15 @@ def initialize_display():
 
     _main_group = displayio.Group()
     _display.root_group = _main_group
+
+    _toggle_button = keypad.Keys((board.BUTTON0,), value_when_pressed=False, pull=True)
+
+def read_button():
+    if _toggle_button is None:
+        return False
+    event = _toggle_button.events.get()
+    if event and event.released:
+        return True
+    return False
+
+

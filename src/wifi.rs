@@ -3,20 +3,27 @@
 use anyhow::{Result, bail};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WiFi::{
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE,
-    WLAN_RADIO_STATE, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle,
-    WlanQueryInterface, dot11_radio_state_on, wlan_interface_state_connected,
-    wlan_intf_opcode_current_connection, wlan_intf_opcode_radio_state,
+    WLAN_CONNECTION_ATTRIBUTES, WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO,
+    WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE, WLAN_RADIO_STATE, WlanCloseHandle, WlanConnect,
+    WlanDisconnect, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
+    dot11_BSS_type_infrastructure, dot11_radio_state_on, wlan_connection_mode_profile,
+    wlan_interface_state_connected, wlan_intf_opcode_current_connection,
+    wlan_intf_opcode_radio_state,
 };
-use windows::core::GUID;
+use windows::core::{GUID, PCWSTR};
 
 /// What a single Wi-Fi adapter is currently doing.
 #[derive(Debug, Clone)]
 pub struct InterfaceStatus {
+    /// Identifies the adapter to the WLAN API, e.g. for [`disconnect`].
+    pub guid: GUID,
     pub description: String,
     pub connected: bool,
     /// SSID of the current connection, when connected and readable.
     pub ssid: Option<String>,
+    /// Name of the saved Wi-Fi profile the connection was made with, when connected and
+    /// readable -- what [`connect`] needs to get back onto the network.
+    pub profile: Option<String>,
     /// True unless the adapter's software radio is known to be off (the Wi-Fi toggle in
     /// Windows Settings / Action Center). Defaults to `true` when the state can't be
     /// read, so a query failure never falsely blocks a legitimate hotspot start.
@@ -118,14 +125,75 @@ pub fn query() -> Result<WifiStatus> {
     Ok(WifiStatus { interfaces })
 }
 
+/// Drop the Wi-Fi connection of the adapter that counts as our real connection (see
+/// [`WifiStatus::active_interface`]). Windows may rejoin a known network by itself
+/// afterwards; callers that need it to stay off must account for that.
+pub fn disconnect(status: &WifiStatus, ignore_ssid: Option<&str>) -> Result<()> {
+    let Some(iface) = status.active_interface(ignore_ssid) else {
+        bail!("no connected Wi-Fi adapter to disconnect");
+    };
+
+    let handle = WlanHandle::open()?;
+    let rc = unsafe { WlanDisconnect(handle.0, &iface.guid, None) };
+    if rc != ERROR_SUCCESS.0 {
+        bail!("WlanDisconnect failed with error {rc}");
+    }
+    Ok(())
+}
+
+/// A Wi-Fi connection that can be re-established later with [`connect`].
+#[derive(Debug, Clone)]
+pub struct WifiProfile {
+    guid: GUID,
+    pub name: String,
+}
+
+impl WifiStatus {
+    /// The profile of the connection [`WifiStatus::active_interface`] reports, if known.
+    pub fn active_profile(&self, ignore_ssid: Option<&str>) -> Option<WifiProfile> {
+        let iface = self.active_interface(ignore_ssid)?;
+        Some(WifiProfile {
+            guid: iface.guid,
+            name: iface.profile.clone()?,
+        })
+    }
+}
+
+/// Connect to a saved profile. Needed after [`disconnect`]: Windows treats that as a
+/// manual disconnect and does not rejoin the network on its own.
+pub fn connect(profile: &WifiProfile) -> Result<()> {
+    let handle = WlanHandle::open()?;
+    let name: Vec<u16> = profile.name.encode_utf16().chain(Some(0)).collect();
+    let params = WLAN_CONNECTION_PARAMETERS {
+        wlanConnectionMode: wlan_connection_mode_profile,
+        strProfile: PCWSTR(name.as_ptr()),
+        pDot11Ssid: std::ptr::null_mut(),
+        pDesiredBssidList: std::ptr::null_mut(),
+        dot11BssType: dot11_BSS_type_infrastructure,
+        dwFlags: 0,
+    };
+
+    let rc = unsafe { WlanConnect(handle.0, &profile.guid, &params, None) };
+    if rc != ERROR_SUCCESS.0 {
+        bail!("WlanConnect to '{}' failed with error {rc}", profile.name);
+    }
+    Ok(())
+}
+
 fn read_interface(handle: HANDLE, info: &WLAN_INTERFACE_INFO) -> InterfaceStatus {
     let connected = info.isState == wlan_interface_state_connected;
     InterfaceStatus {
+        guid: info.InterfaceGuid,
         description: wide_to_string(&info.strInterfaceDescription),
         connected,
         // The SSID only exists while associated, so skip the query otherwise.
         ssid: if connected {
             current_ssid(handle, &info.InterfaceGuid)
+        } else {
+            None
+        },
+        profile: if connected {
+            current_profile(handle, &info.InterfaceGuid)
         } else {
             None
         },
@@ -176,6 +244,15 @@ fn current_ssid(handle: HANDLE, guid: &GUID) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The saved profile the adapter's current connection was made with. Best effort, like
+/// `current_ssid`.
+fn current_profile(handle: HANDLE, guid: &GUID) -> Option<String> {
+    let read = |attrs: &WLAN_CONNECTION_ATTRIBUTES| wide_to_string(&attrs.strProfileName);
+    let name = unsafe { query_interface(handle, guid, wlan_intf_opcode_current_connection, read) }?;
+
+    (!name.is_empty()).then_some(name)
+}
+
 /// Whether the adapter's software radio is on.
 ///
 /// Best effort: like `current_ssid`, a query failure only costs a less precise status --
@@ -205,9 +282,11 @@ mod tests {
 
     fn iface(connected: bool, ssid: Option<&str>) -> InterfaceStatus {
         InterfaceStatus {
+            guid: GUID::zeroed(),
             description: "test".into(),
             connected,
             ssid: ssid.map(str::to_string),
+            profile: None,
             radio_enabled: true,
         }
     }

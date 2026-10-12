@@ -5,16 +5,22 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use std::time::Duration;
+
 use tokio::sync::Notify;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::{self, Adapter};
-use crate::companion::CompanionSession;
+use crate::companion::{Command, CompanionSession};
 use crate::config::Config;
 use crate::hotspot::{Hotspot, State};
 use crate::policy::{Intent, OnReconnect, Policy};
 use crate::status::{self, Status};
 use crate::wifi;
+
+/// How often the companion is checked for a button press.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The watchdog loop. Runs until `stop` is notified; pass a `Notify` that's never
 /// notified to run forever, as the console `run` command does.
@@ -30,6 +36,9 @@ struct Watchdog<'a> {
     ignore_ssid: Option<&'a str>,
     policy: Policy,
     companion: CompanionSession,
+    /// The Wi-Fi connection a companion toggle disconnected, to be rejoined when the
+    /// toggle is reversed.
+    parked_wifi: Option<wifi::WifiProfile>,
 }
 
 impl<'a> Watchdog<'a> {
@@ -45,6 +54,7 @@ impl<'a> Watchdog<'a> {
             ignore_ssid: Some(cfg.hotspot.ssid.as_str()),
             policy: Policy::new(cfg.monitor.disconnect_threshold(), on_reconnect),
             companion: CompanionSession::new(cfg.companion),
+            parked_wifi: None,
         }
     }
 
@@ -60,12 +70,21 @@ impl<'a> Watchdog<'a> {
             "autospot starting"
         );
 
-        loop {
-            self.tick(Instant::now()).await;
+        // The first tick of an interval completes immediately, so both start at once.
+        let mut poll = tokio::time::interval(self.cfg.monitor.poll_interval());
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut commands = tokio::time::interval(COMMAND_POLL_INTERVAL);
+        commands.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let companion_enabled = self.cfg.companion.enabled;
 
-            // Wait out the poll interval, unless we are asked to stop first.
+        loop {
             tokio::select! {
-                _ = tokio::time::sleep(self.cfg.monitor.poll_interval()) => {}
+                _ = poll.tick() => self.tick(Instant::now()).await,
+                _ = commands.tick(), if companion_enabled => {
+                    if let Some(Command::Toggle) = self.companion.poll_command() {
+                        self.handle_toggle(Instant::now()).await;
+                    }
+                }
                 _ = stop.notified() => break,
             }
         }
@@ -100,6 +119,12 @@ impl<'a> Watchdog<'a> {
 
         if !wifi_ok {
             return;
+        }
+
+        // Wi-Fi is back, whatever got it there (possibly another network entirely), so
+        // the toggle's remembered profile must not be reconnected to later.
+        if status.is_connected(self.ignore_ssid) && self.parked_wifi.take().is_some() {
+            debug!("Wi-Fi is connected again; forgetting the parked profile");
         }
 
         let intent = self
@@ -151,6 +176,90 @@ impl<'a> Watchdog<'a> {
                 }
             }
         }
+    }
+
+    /// The companion's button was pressed: swap Wi-Fi for the hotspot, or the hotspot
+    /// back off. State is read afresh rather than taken from the last tick, since it may
+    /// be several seconds old.
+    async fn handle_toggle(&mut self, now: Instant) {
+        let status = match wifi::query() {
+            Ok(status) => status,
+            Err(e) => {
+                warn!("companion toggle ignored, could not read Wi-Fi state: {e:#}");
+                return;
+            }
+        };
+        let hotspot_state = Hotspot::for_uplink(&self.cfg.hotspot)
+            .and_then(|h| h.state())
+            .inspect_err(|e| debug!("hotspot state unavailable for toggle: {e:#}"))
+            .ok();
+
+        let action = toggle_action(status.is_connected(self.ignore_ssid), hotspot_state);
+        info!(?action, "companion requested a toggle");
+
+        match action {
+            ToggleAction::StartHotspot => {
+                if self.uplink_is_active_wifi(&status) {
+                    error!(
+                        uplink = %self.cfg.hotspot.uplink_adapter,
+                        "not switching to the hotspot: its uplink is the Wi-Fi connection \
+                         that would be disconnected"
+                    );
+                    return;
+                }
+                let profile = status.active_profile(self.ignore_ssid);
+                if let Err(e) = wifi::disconnect(&status, self.ignore_ssid) {
+                    error!("could not disconnect Wi-Fi: {e:#}");
+                    return;
+                }
+                // Remember it: Windows won't rejoin by itself after a manual disconnect.
+                self.parked_wifi = profile;
+                if let Err(e) = self.try_start(&status).await {
+                    error!("could not start the hotspot: {e:#}");
+                    return;
+                }
+                // Even if it was already on: the user asked for it, so it is ours to
+                // turn off again when Wi-Fi returns.
+                self.policy.record_started();
+            }
+            ToggleAction::StopHotspot => match self.try_stop().await {
+                Ok(()) => {
+                    self.policy.record_manual_stop();
+                    self.reconnect_wifi();
+                }
+                Err(e) => error!("could not stop the hotspot: {e:#}"),
+            },
+            ToggleAction::Nothing => {}
+        }
+
+        // Show the outcome now rather than at the next poll.
+        let status = wifi::query().unwrap_or_default();
+        let adapters = adapters::list().unwrap_or_default();
+        let live_hotspot = query_hotspot(self.cfg);
+        let report = self.companion_status(true, &status, &adapters, live_hotspot.as_ref());
+        self.companion.report(now, report);
+    }
+
+    /// Rejoin the Wi-Fi network a toggle disconnected, if there is one to rejoin.
+    fn reconnect_wifi(&mut self) {
+        let Some(profile) = self.parked_wifi.take() else {
+            debug!("no parked Wi-Fi profile to reconnect to");
+            return;
+        };
+        match wifi::connect(&profile) {
+            Ok(()) => info!(profile = %profile.name, "reconnecting Wi-Fi"),
+            Err(e) => error!("could not reconnect Wi-Fi: {e:#}"),
+        }
+    }
+
+    /// Is the hotspot's uplink the very Wi-Fi adapter that is currently connected?
+    fn uplink_is_active_wifi(&self, status: &wifi::WifiStatus) -> bool {
+        let Some(active) = status.active_interface(self.ignore_ssid) else {
+            return false;
+        };
+        adapters::list().unwrap_or_default().iter().any(|a| {
+            a.description == active.description && a.matches(&self.cfg.hotspot.uplink_adapter)
+        })
     }
 
     /// Bring the hotspot up, unless it is already up or mid-transition.
@@ -240,6 +349,27 @@ impl<'a> Watchdog<'a> {
         });
 
         Status::new(&wifi, hotspot.as_ref())
+    }
+}
+
+/// What a companion toggle request should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleAction {
+    /// Wi-Fi is connected: drop it and bring the hotspot up.
+    StartHotspot,
+    /// No Wi-Fi, but the hotspot is on: switch it off.
+    StopHotspot,
+    Nothing,
+}
+
+/// Decide a toggle from the current state. A hotspot that is mid-transition is left
+/// alone; neither is there anything to do with Wi-Fi down and the hotspot off.
+fn toggle_action(wifi_connected: bool, hotspot: Option<State>) -> ToggleAction {
+    match (wifi_connected, hotspot) {
+        (_, Some(State::InTransition)) => ToggleAction::Nothing,
+        (true, _) => ToggleAction::StartHotspot,
+        (false, Some(State::On)) => ToggleAction::StopHotspot,
+        (false, _) => ToggleAction::Nothing,
     }
 }
 
@@ -349,9 +479,11 @@ uplink_adapter = "Ethernet"
     fn connected_status(description: &str, ssid: &str) -> wifi::WifiStatus {
         wifi::WifiStatus {
             interfaces: vec![wifi::InterfaceStatus {
+                guid: windows::core::GUID::zeroed(),
                 description: description.into(),
                 connected: true,
                 ssid: Some(ssid.into()),
+                profile: None,
                 radio_enabled: true,
             }],
         }
@@ -359,6 +491,33 @@ uplink_adapter = "Ethernet"
 
     fn disconnected_status() -> wifi::WifiStatus {
         wifi::WifiStatus { interfaces: vec![] }
+    }
+
+    #[test]
+    fn toggle_swaps_wifi_for_the_hotspot_and_back() {
+        assert_eq!(
+            toggle_action(true, Some(State::Off)),
+            ToggleAction::StartHotspot
+        );
+        assert_eq!(toggle_action(true, None), ToggleAction::StartHotspot);
+        assert_eq!(
+            toggle_action(false, Some(State::On)),
+            ToggleAction::StopHotspot
+        );
+    }
+
+    #[test]
+    fn toggle_does_nothing_when_there_is_nothing_to_switch() {
+        assert_eq!(toggle_action(false, Some(State::Off)), ToggleAction::Nothing);
+        assert_eq!(toggle_action(false, None), ToggleAction::Nothing);
+        assert_eq!(
+            toggle_action(true, Some(State::InTransition)),
+            ToggleAction::Nothing
+        );
+        assert_eq!(
+            toggle_action(false, Some(State::InTransition)),
+            ToggleAction::Nothing
+        );
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub struct Policy {
     started_by_us: bool,
     /// Set after a failed start so we do not retry on every poll.
     retry_after: Option<Instant>,
+    /// Set when the user switched the hotspot off by hand while Wi-Fi was down, so the
+    /// watchdog does not immediately turn it back on. Cleared once Wi-Fi returns.
+    suppress_auto_start: bool,
 }
 
 impl Policy {
@@ -68,6 +71,7 @@ impl Policy {
             disconnected_since: None,
             started_by_us: false,
             retry_after: None,
+            suppress_auto_start: false,
         }
     }
 
@@ -78,6 +82,7 @@ impl Policy {
                 return Intent::Idle;
             };
             self.retry_after = None;
+            self.suppress_auto_start = false;
             return Intent::WifiRestored {
                 down_for: now.saturating_duration_since(since),
                 stop_hotspot: self.started_by_us && self.on_reconnect == OnReconnect::StopHotspot,
@@ -88,6 +93,10 @@ impl Policy {
             self.disconnected_since = Some(now);
             return Intent::WifiLost;
         };
+
+        if self.suppress_auto_start {
+            return Intent::Idle;
+        }
 
         let down_for = now.saturating_duration_since(since);
         if down_for < self.threshold {
@@ -111,6 +120,14 @@ impl Policy {
     pub fn record_started(&mut self) {
         self.started_by_us = true;
         self.retry_after = None;
+        self.suppress_auto_start = false;
+    }
+
+    /// Record that the user switched the hotspot off by hand: no automatic restart until
+    /// Wi-Fi has come back at least once.
+    pub fn record_manual_stop(&mut self) {
+        self.started_by_us = false;
+        self.suppress_auto_start = true;
     }
 
     /// Record that the hotspot is no longer our responsibility.
@@ -313,6 +330,38 @@ mod tests {
         // No record_started(), e.g. the caller found the profile missing.
         assert!(matches!(
             w.evaluate(t0 + THRESHOLD + Duration::from_secs(5), false),
+            Intent::StartHotspot { .. }
+        ));
+    }
+
+    #[test]
+    fn a_manual_stop_blocks_the_automatic_restart_until_wifi_returns() {
+        let (mut w, t0) = policy();
+        w.evaluate(t0, false);
+        w.record_manual_stop();
+
+        assert_eq!(w.evaluate(t0 + THRESHOLD, false), Intent::Idle);
+        assert_eq!(w.evaluate(at(t0, 500), false), Intent::Idle);
+
+        // Wi-Fi returns, then drops again: normal behaviour resumes.
+        w.evaluate(at(t0, 600), true);
+        let t1 = at(t0, 700);
+        assert_eq!(w.evaluate(t1, false), Intent::WifiLost);
+        assert!(matches!(
+            w.evaluate(t1 + THRESHOLD, false),
+            Intent::StartHotspot { .. }
+        ));
+    }
+
+    #[test]
+    fn starting_the_hotspot_again_lifts_a_manual_stop() {
+        let (mut w, t0) = policy();
+        w.evaluate(t0, false);
+        w.record_manual_stop();
+        w.record_started();
+
+        assert!(matches!(
+            w.evaluate(t0 + THRESHOLD, false),
             Intent::StartHotspot { .. }
         ));
     }
