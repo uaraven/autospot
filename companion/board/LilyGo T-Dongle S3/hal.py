@@ -20,6 +20,7 @@ hotspot_bitmap = displayio.OnDiskBitmap("/images/hotspot.bmp")
 nodata_bitmap = displayio.OnDiskBitmap("/images/no-data.bmp")
 pass_bitmap = displayio.OnDiskBitmap("/images/lock.bmp")
 clock_bitmap = displayio.OnDiskBitmap("/images/clock.bmp")
+switch_bitmap = displayio.OnDiskBitmap("/images/switch.bmp")
 
 def _clear_group():
     if _main_group != None:
@@ -63,10 +64,13 @@ def show_info(items):
     elif items['status'] == "wifi-off":
         _ico_line(disc_bitmap, "Wi-Fi: OFF", 35)
     elif items['status'] == "message":
-        _ico_line(nodata_bitmap, items['message'], 35)
+        _add_line(items['message'], 35)
     else:
         _ico_line(nodata_bitmap, 'No data', 25)
         _add_line("Run autospot.exe", 48)
+
+    _main_group.append(_icon(switch_bitmap, (_display.width - 16)//2, 0))
+
     _display.refresh()
 
 

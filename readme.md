@@ -73,8 +73,6 @@ The companion device is a DIY USB dongle with a microcontroller and a display. I
 
 Compatible companion devices can toggle the computer between Hotspot and Wi-Fi mode. If the button is pressed while device is connected to the Wi-Fi, the Hotspot will be turned on. Press button again to disable hotspot and reconnect to the previously connected Wi-Fi network.
 
-While a companion is detected, autospot keeps its serial port open, so other programs (e.g. a serial monitor) cannot use that COM port at the same time.
-
 See the [companion's readme](companion/readme.md) for details.
 
 ## Windows 10 compatibility
