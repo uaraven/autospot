@@ -60,7 +60,9 @@ def show_info(items):
         else:
             _ico_line(disc_bitmap, 'Disconnected', 50)
     elif items['status'] == "wifi-off":
-        _icoline(disc_bitmap, "Wi-Fi: OFF", 50)
+        _ico_line(disc_bitmap, "Wi-Fi: OFF", 50)
+    elif items['status'] == "message":
+        _add_line(items['message'], 50)        
     else:
         _ico_line(nodata_bitmap, 'No data', 40)
         _add_line("Run autospot.exe", 75)
@@ -90,3 +92,6 @@ def initialize_display():
 
     _main_group = displayio.Group()
     _display.root_group = _main_group
+
+def read_button():
+    return False

@@ -71,6 +71,8 @@ There is an `autospot.toml` configuration file distributed alongside `autospot.e
 
 The companion device is a DIY USB dongle with a microcontroller and a display. It simplifies the astrophotographer's life (already complicated enough without all this IT shit) by showing the NINA computer's current connection status, its IP address for remote desktop connections, and the hotspot's SSID and password when the hotspot is enabled.
 
+Compatible companion devices can toggle the computer between Hotspot and Wi-Fi mode. If the button is pressed while device is connected to the Wi-Fi, the Hotspot will be turned on. Press button again to disable hotspot and reconnect to the previously connected Wi-Fi network.
+
 See the [companion's readme](companion/readme.md) for details.
 
 ## Windows 10 compatibility

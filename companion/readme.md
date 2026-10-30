@@ -22,10 +22,18 @@ autospot.exe running on the host computer automatically detects the companion de
 
 Companion device shows the status received from the autospot, including active Wi-Fi connection with the host IP address, name of the hotspot, password and host IP address in the Hotspot mode and others.
 
-There is no way to test all the available devices for compatibility, but most of the RP2040, RP2350 and ESP32-S3 based devices should work. 
+There is no way to test all the available devices for compatibility, but most of the RP2040, RP2350 and ESP32-S3 based devices should work.
 
 Boards that are not listed in the [list below](#supported-boards) can work, but might require some programming to properly support
 display. Display bus, initialization, resolution might require writing a new hardware abstraction layer for the board. See [board docs](board/readme.md) for details.
+
+
+### Two-way communication
+
+Some boards support two-way communications with autospot executable running on the computer. This means that they can send commands to the main PC. Current (as of v0.5.0 and higher) implementation supports 
+turning on Hotspot with a button press on companion device.
+
+Not every device supports this functionality as it requires either a button or a touchscreen. Devices supporting two-way communications should display an indicator (![](switch.png)) somewhere on the screen (if available), usually near the button that triggers the action.
 
 ## Installation
 
@@ -37,16 +45,16 @@ Run autospot - the status of the connection should be displayed on the controlle
 
 If autospot's logs shows "no companion device found", you might need to change the configuration of the USB device, refer to [companion installation guide](install.txt) for more details.
 
-
 ## Supported boards
 
-|                                   Board                                   | CircuitPython download                                   | Notes                                        |
-| :------------------------------------------------------------------------ | :------------------------------------------------------- | :------------------------------------------- |
-| [LilyGo T-Display RP2040](https://lilygo.cc/collections/t-display-series) | https://circuitpython.org/board/lilygo_t_display_rp2040/ | It looks like LilyGo discontinued this board |
-|    [Waveshare RP2350-Geek](https://www.waveshare.com/wiki/RP2350-GEEK)    | https://circuitpython.org/board/waveshare_rp2350_geek/   |                                              |
-| [LilyGo T-Dongle S3 (K193)](https://lilygo.cc/products/t-dongle-s3)| https://circuitpython.org/board/lilygo_tdongle_s3/ | Install CircuitPython using .bin file |
-| [LilyGo T-Display S3](https://lilygo.cc/products/t-display-s3)| https://circuitpython.org/board/lilygo_tdisplay_s3/ | Install CircuitPython using .bin file |
+| Board | CircuitPython download | Two-way communication | Notes|
+| :-- | :--- | :-------------------: | :------------------------------------------- |
+| [LilyGo T-Display RP2040](https://lilygo.cc/collections/t-display-series) | https://circuitpython.org/board/lilygo_t_display_rp2040/ |  Unimplemented\*   |It looks like LilyGo discontinued this board |
+| [Waveshare RP2350-Geek](https://www.waveshare.com/wiki/RP2350-GEEK)       | https://circuitpython.org/board/waveshare_rp2350_geek/   |     Unsupported       | |
+| [LilyGo T-Dongle S3 (K193)](https://lilygo.cc/products/t-dongle-s3)       | https://circuitpython.org/board/lilygo_tdongle_s3/      | Supported| Install CircuitPython using .bin file |
+| [LilyGo T-Display S3](https://lilygo.cc/products/t-display-s3) | https://circuitpython.org/board/lilygo_tdisplay_s3/ | Supported | Install CircuitPython using .bin file        |
 
+\* Button click for Hotspot switch was not implemented for these devices, but in general it should work
 
 ## Contributing
 
@@ -57,6 +65,7 @@ If you want to add support for a new microcontroller board follow these steps:
 - create `hal.py` file and implement the following functions:
   - initialize_display() - to initialize the display
   - show_info(items: dict) - to display the information
+  - read_button() -> bool - to check the button status
 - create pull request
 
 See [this file](board/readme.md) for more details on HAL implementation.
